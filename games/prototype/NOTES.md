@@ -86,8 +86,12 @@ Ghidra 12.1.4 (official zip, SHA-256 pinned) and capstone were installed under `
 - **Milestone 1 (transport loopback) works:** the ASI diagnostic hooks `ChannelManager::Open`, `Channel::Send`, `Channel::Receive`, `StartSync`, `UpdateSync` and `ApplySyncMessage`. A fake `SyncOwner` starts the engine's sync, the host sends 8-byte `PCOP` heartbeats through the engine's `SendSyncMessage` -> `Channel::Send`, and the client receives them through `UpdateSync` -> `Channel::Receive` -> `ApplySyncMessage`. Host sent 13; client logged 8 received. `GetNetSystem` is null in single-player, so the plugin installs a fake `NetSystem` with `unknown20 = 0`; without that, `SendSyncMessage` cannot resolve a target.
 - The engine's real `SendSyncMessage` path is now exercised: the log shows `fake Channel::Send target=0 type=0 len=8 flag=1` followed by `heartbeat via SendSyncMessage`.
 - No game crash from the hooks; the host later exited by `TimedExit`.
-- **Menu automation is blocked:** synthetic mouse/keyboard (`SetForegroundWindow`, `SetCursorPos`, `mouse_event`, `keybd_event`) did not advance the "PULSA INTRO" title screen. The game likely reads DirectInput and ignores injected events. To load a save for gameplay tests we need an XInput proxy (scripted gamepad) or a manual load by the owner.
-- No gameplay/save has been loaded yet; all tests are at the title/menu or transport level.
+- **Menu automation works with an XInput proxy:** `xinput1_3.dll` forwards to the system DLL and injects a scripted gamepad on user 0. With 120 ms button pulses it reaches the main menu, selects CONTINUAR, loads `slot-A` and enters gameplay. A held button repeats and skips to SALIR; keep pulses short.
+- **Transform sync works:** after both clients load gameplay, the host reads the local player's matrix (`GameObject+0x1C` -> transform attribute -> matrix translation at +0x30) and sends a quantized 8-byte `P1` packet; the client receives it through `UpdateSync` -> `Channel::Receive` -> `ApplySyncMessage` and logs the same position (`-246.62, 49.22, 51.72`).
+- **Crash fix:** installing a fake `NetSystem` with only `+0x20` broke `PackPlayerId` (`0x108EC2F0`) at `0x8EC319`; `NetSystem+0x14` must point to a valid local address. With `+0x14` set to a 4-byte zero, gameplay loads and runs with the plugin.
+- Two gameplay clients now run with the plugin and proxy; saves were not modified. The client only loaded gameplay when its window was brought to the front during the menu sequence.
+- No remote avatar yet: there is still one player object (`p0`); `p1` is null.
+
 - Build: `build/coop/prototype_coop.asi` (PE32, exports `InitializeASI`), built with llvm-mingw 2026-11-04 + MinHook 1.3.4.
 
 

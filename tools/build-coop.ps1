@@ -39,3 +39,8 @@ $Out = Join-Path $Build "prototype_coop.asi"
 & $ClangPP @Common -shared -o $Out $DiagObj $Objects -static -static-libgcc -static-libstdc++ -lws2_32
 if ($LASTEXITCODE -ne 0) { throw "link failed" }
 Write-Host "built $Out"
+
+$ProxyOut = Join-Path $Build "xinput1_3.dll"
+& $ClangPP @Common -shared -o $ProxyOut "$Src\xinput_proxy.cpp" "$Src\xinput1_3.def" -static -static-libgcc -static-libstdc++
+if ($LASTEXITCODE -ne 0) { throw "xinput proxy link failed" }
+Write-Host "built $ProxyOut"

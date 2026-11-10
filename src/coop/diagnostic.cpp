@@ -26,7 +26,10 @@ struct FakeChannelManager { unsigned char pad[4]; };
 struct FakeChannel { unsigned int pad; };
 struct FakeNetSystem
 {
-    unsigned char pad[0x24];
+    unsigned char pad[0x14];
+    void* localAddress;
+    unsigned char pad2[8];
+    int target;
 };
 struct FakeSyncOwner
 {
@@ -39,6 +42,7 @@ struct FakeSyncOwner
 static FakeChannelManager g_fakeChannelManager;
 static FakeChannel g_fakeChannel;
 static FakeNetSystem g_fakeNetSystem;
+static unsigned int g_fakeAddress;
 static FakeSyncOwner g_fakeOwner;
 static int g_peerMask = 2;
 
@@ -97,6 +101,8 @@ static UpdateSyncFn g_updateSync = nullptr;
 static ApplySyncFn g_applySync = nullptr;
 static SendSyncMessageFn g_sendSyncMessage = nullptr;
 static GetPlayerObjectFn g_getPlayerObject = nullptr;
+
+static void __thiscall HookSend(void* self, int target, int type, const void* data, unsigned int length, int flag);
 
 static void ReadConfig()
 {
@@ -167,6 +173,45 @@ static void SendHeartbeat()
         Log("heartbeat direct %u", g_heartbeat);
     else
         Log("heartbeat send failed: %d", WSAGetLastError());
+}
+
+static bool ReadPlayerPosition(float* x, float* y, float* z)
+{
+    if (g_getPlayerObject == nullptr || g_engine == nullptr) return false;
+    void* player = g_getPlayerObject(0);
+    if (player == nullptr) return false;
+    void* transformAttribute = *(void**)(reinterpret_cast<unsigned char*>(player) + 0x1c);
+    if (transformAttribute == nullptr) return false;
+    void** vtable = *(void***)transformAttribute;
+    if (vtable == nullptr || vtable[1] == nullptr) return false;
+    using GetMatrixFn = void* (__thiscall*)(void*);
+    void* matrix = reinterpret_cast<GetMatrixFn>(vtable[1])(transformAttribute);
+    if (matrix == nullptr) return false;
+    *x = *(float*)(reinterpret_cast<unsigned char*>(matrix) + 0x30);
+    *y = *(float*)(reinterpret_cast<unsigned char*>(matrix) + 0x34);
+    *z = *(float*)(reinterpret_cast<unsigned char*>(matrix) + 0x38);
+    return true;
+}
+
+static void SendPlayerTransform()
+{
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    if (!ReadPlayerPosition(&x, &y, &z)) return;
+    // UpdateSync receives at most 8 bytes; send a quantized position in one
+    // SyncMessage-sized datagram: "P1" + three int16 coordinates (1/32 unit).
+    unsigned char packet[8] = { 'P', '1', 0, 0, 0, 0, 0, 0 };
+    int qx = (int)(x * 32.0f);
+    int qy = (int)(y * 32.0f);
+    int qz = (int)(z * 32.0f);
+    if (qx > 32767) qx = 32767; if (qx < -32768) qx = -32768;
+    if (qy > 32767) qy = 32767; if (qy < -32768) qy = -32768;
+    if (qz > 32767) qz = 32767; if (qz < -32768) qz = -32768;
+    short sx = (short)qx, sy = (short)qy, sz = (short)qz;
+    memcpy(packet + 2, &sx, 2);
+    memcpy(packet + 4, &sy, 2);
+    memcpy(packet + 6, &sz, 2);
+    Log("transform host %.2f %.2f %.2f -> %d %d %d", x, y, z, sx, sy, sz);
+    HookSend(&g_fakeChannel, 0, 1, packet, sizeof(packet), 1);
 }
 
 static void* __thiscall HookOpen(void* self, unsigned char kind, unsigned int a, unsigned int b)
@@ -249,6 +294,8 @@ static void StartFakeSession()
     g_fakeOwner.machines = 3;
     g_fakeOwner.session = &g_fakeChannelManager;
     memset(&g_fakeNetSystem, 0, sizeof(g_fakeNetSystem));
+    g_fakeNetSystem.localAddress = &g_fakeAddress;
+    g_fakeNetSystem.target = 0;
     *(void**)(reinterpret_cast<unsigned char*>(g_engine) + 0x13187D4) = &g_fakeNetSystem;
     g_started = true;
     Log("starting fake session");
@@ -260,7 +307,10 @@ static void __cdecl HookUpdateSync()
     if (!g_started && g_updateCalls > 300)
         StartFakeSession();
     if (g_started && g_isHost && (g_updateCalls % 60) == 0)
+    {
         SendHeartbeat();
+        SendPlayerTransform();
+    }
     if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
     {
         void* player0 = g_getPlayerObject(0);
@@ -278,6 +328,16 @@ static void* __cdecl HookApplySync(const unsigned int* machines, int type, const
     if (message != nullptr && memcmp(message, "PCOP", 4) == 0)
     {
         Log("heartbeat received from mask=%08X", machines ? *machines : 0);
+        return nullptr;
+    }
+    if (message != nullptr && memcmp(message, "P1", 2) == 0)
+    {
+        const unsigned char* bytes = (const unsigned char*)message;
+        short sx, sy, sz;
+        memcpy(&sx, bytes + 2, 2);
+        memcpy(&sy, bytes + 4, 2);
+        memcpy(&sz, bytes + 6, 2);
+        Log("transform client %.2f %.2f %.2f", sx / 32.0f, sy / 32.0f, sz / 32.0f);
         return nullptr;
     }
     if (g_applyCalls < 40)
