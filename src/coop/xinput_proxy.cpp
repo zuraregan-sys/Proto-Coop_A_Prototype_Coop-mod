@@ -61,6 +61,7 @@ namespace
     FILE* g_log = nullptr;
     DWORD g_start = 0;
     DWORD g_packet = 0;
+    bool g_movesForward = true;
 
     using GetStateFn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
     using SetStateFn = DWORD (WINAPI*)(DWORD, XINPUT_VIBRATION*);
@@ -137,6 +138,11 @@ namespace
         if (elapsedMs >= 62000 && elapsedMs < 62120) return 0x1000; // A (confirm)
         if (elapsedMs >= 70000 && elapsedMs < 70120) return 0x1000; // A (if a prompt remains)
         if (elapsedMs >= 78000 && elapsedMs < 78120) return 0x1000;
+        // Dismiss the "free roam" info panel the mission shows after loading.
+        if (elapsedMs >= 86000 && elapsedMs < 86120) return 0x1000;
+        if (elapsedMs >= 96000 && elapsedMs < 96120) return 0x1000;
+        if (elapsedMs >= 106000 && elapsedMs < 106120) return 0x1000;
+        if (elapsedMs >= 116000 && elapsedMs < 116120) return 0x1000;
         return 0;
     }
 }
@@ -156,6 +162,13 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
         state->Gamepad.sThumbRY = 0;
         if (buttons != 0)
             Log("scripted buttons=%04X at %lu ms", buttons, elapsed);
+        // Only one instance walks, so the other one can watch the puppet follow.
+        if (g_movesForward && elapsed >= 130000 && elapsed < 137000)
+        {
+            state->Gamepad.sThumbLY = 20000;
+            if ((elapsed % 1000) < 20)
+                Log("scripted walk at %lu ms", elapsed);
+        }
         return ERROR_SUCCESS;
     }
     return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
@@ -228,6 +241,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         DisableThreadLibraryCalls(module);
         g_start = GetTickCount();
+        char selfPath[MAX_PATH];
+        if (GetModuleFileNameA(module, selfPath, MAX_PATH) != 0)
+            g_movesForward = strstr(selfPath, "TestInstances\\1\\") == nullptr;
         InitLog(module);
         Log("xinput proxy attached");
         LoadReal();

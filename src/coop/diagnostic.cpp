@@ -1,4 +1,4 @@
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -51,6 +51,8 @@ static sockaddr_in g_peer;
 static unsigned short g_localPort = 27016;
 static unsigned short g_peerPort = 27017;
 static bool g_isHost = true;
+static bool g_testMove = false;
+static bool g_testMoved = false;
 static unsigned int g_heartbeat = 0;
 
 static void Log(const char* format, ...)
@@ -101,6 +103,20 @@ static UpdateSyncFn g_updateSync = nullptr;
 static ApplySyncFn g_applySync = nullptr;
 static SendSyncMessageFn g_sendSyncMessage = nullptr;
 static GetPlayerObjectFn g_getPlayerObject = nullptr;
+static void* g_findTemplate = nullptr;
+static void* g_createObject = nullptr;
+static void* g_setPosition = nullptr;
+static void* g_getHandle = nullptr;
+static void* g_nameCtor = nullptr;
+static void* g_findAttribute = nullptr;
+static void* g_getText = nullptr;
+static bool g_spawnPending = false;
+static bool g_puppetSpawned = false;
+static bool g_attrDumped = false;
+static void* g_puppetObject = nullptr;
+static bool g_remoteValid = false;
+static bool g_localOffsetTest = false;
+static float g_remoteX = 0.0f, g_remoteY = 0.0f, g_remoteZ = 0.0f;
 
 static void __thiscall HookSend(void* self, int target, int type, const void* data, unsigned int length, int flag);
 
@@ -119,6 +135,7 @@ static void ReadConfig()
     g_localPort = (unsigned short)GetPrivateProfileIntA("coop", "port", g_isHost ? 27016 : 27017, path);
     g_peerPort = (unsigned short)GetPrivateProfileIntA("coop", "peer_port", g_isHost ? 27017 : 27016, path);
     g_peerMask = g_isHost ? 1 : 2;
+    g_testMove = GetPrivateProfileIntA("coop", "test_move", 0, path) != 0;
     Log("config role=%s local=%u peer=%u mask=%d", g_isHost ? "host" : "client", g_localPort, g_peerPort, g_peerMask);
 }
 
@@ -175,10 +192,8 @@ static void SendHeartbeat()
         Log("heartbeat send failed: %d", WSAGetLastError());
 }
 
-static bool ReadPlayerPosition(float* x, float* y, float* z)
+static bool ReadObjectPosition(void* player, float* x, float* y, float* z)
 {
-    if (g_getPlayerObject == nullptr || g_engine == nullptr) return false;
-    void* player = g_getPlayerObject(0);
     if (player == nullptr) return false;
     void* transformAttribute = *(void**)(reinterpret_cast<unsigned char*>(player) + 0x1c);
     if (transformAttribute == nullptr) return false;
@@ -193,12 +208,23 @@ static bool ReadPlayerPosition(float* x, float* y, float* z)
     return true;
 }
 
+static bool ReadPlayerPosition(float* x, float* y, float* z)
+{
+    if (g_getPlayerObject == nullptr || g_engine == nullptr) return false;
+    return ReadObjectPosition(g_getPlayerObject(0), x, y, z);
+}
+
+static void SetObjectPosition(void* object, float x, float y, float z)
+{
+    if (object == nullptr || g_setPosition == nullptr) return;
+    float position[3] = { x, y, z };
+    reinterpret_cast<void (__thiscall*)(void*, const float*)>(g_setPosition)(object, position);
+}
+
 static void SendPlayerTransform()
 {
     float x = 0.0f, y = 0.0f, z = 0.0f;
     if (!ReadPlayerPosition(&x, &y, &z)) return;
-    // UpdateSync receives at most 8 bytes; send a quantized position in one
-    // SyncMessage-sized datagram: "P1" + three int16 coordinates (1/32 unit).
     unsigned char packet[8] = { 'P', '1', 0, 0, 0, 0, 0, 0 };
     int qx = (int)(x * 32.0f);
     int qy = (int)(y * 32.0f);
@@ -213,6 +239,234 @@ static void SendPlayerTransform()
     Log("transform host %.2f %.2f %.2f -> %d %d %d", x, y, z, sx, sy, sz);
     HookSend(&g_fakeChannel, 0, 1, packet, sizeof(packet), 1);
 }
+
+static const char* NameText(const void* name)
+{
+    using GetTextFn = const char* (__thiscall*)(const void*);
+    if (name == nullptr || g_getText == nullptr) return "(?)";
+    const char* text = reinterpret_cast<GetTextFn>(g_getText)(name);
+    if (text == nullptr) return "(null)";
+    if (strcmp(text, "?Name?") == 0) return "(hash-only)";
+    return text;
+}
+
+// Walks the attribute lists of a game object: the static one at +8..+C and the
+// dynamic one behind +0x18. Entries are 16 bytes: name key then attribute pointer.
+static void DumpAttributes(void* object)
+{
+    if (object == nullptr) return;
+    unsigned char* bytes = reinterpret_cast<unsigned char*>(object);
+    unsigned int begin = *(unsigned int*)(bytes + 8);
+    unsigned int end = *(unsigned int*)(bytes + 0xC);
+    unsigned int count = (end - begin) / 16;
+    Log("attrs: static begin=%08X end=%08X count=%u", begin, end, count);
+    for (unsigned int i = 0; i < count && i < 256; ++i)
+    {
+        unsigned char* entry = reinterpret_cast<unsigned char*>(begin) + i * 16;
+        void* attribute = *(void**)(entry + 8);
+        Log("attrs: [%u] key='%s' hash=%08X:%08X attr=%p vtable=%08X", i, NameText(entry),
+            *(unsigned int*)(entry + 4), *(unsigned int*)entry, attribute,
+            attribute != nullptr ? *(unsigned int*)attribute : 0);
+        if (attribute != nullptr)
+            Log("attrs:     value0='%s' value1='%s'", NameText(reinterpret_cast<unsigned char*>(attribute) + 4),
+                NameText(reinterpret_cast<unsigned char*>(attribute) + 0xC));
+    }
+    unsigned int dynamicList = *(unsigned int*)(bytes + 0x18);
+    if (dynamicList == 0)
+    {
+        Log("attrs: no dynamic list");
+        return;
+    }
+    unsigned int dynBegin = *(unsigned int*)dynamicList;
+    unsigned int dynEnd = *(unsigned int*)(dynamicList + 4);
+    Log("attrs: dynamic list=%08X begin=%08X end=%08X count=%u", dynamicList, dynBegin, dynEnd,
+        (dynEnd - dynBegin) / 16);
+    for (unsigned int i = 0; i < (dynEnd - dynBegin) / 16 && i < 256; ++i)
+    {
+        unsigned char* entry = reinterpret_cast<unsigned char*>(dynBegin) + i * 16;
+        void* attribute = *(void**)(entry + 8);
+        Log("attrs: d[%u] key='%s' vtable=%08X", i, NameText(entry),
+            attribute != nullptr ? *(unsigned int*)attribute : 0);
+        if (attribute != nullptr)
+            Log("attrs:     value0='%s'", NameText(reinterpret_cast<unsigned char*>(attribute) + 4));
+    }
+}
+
+static bool Plausible(const void* pointer)
+{
+    unsigned int value = reinterpret_cast<unsigned int>(pointer);
+    return value >= 0x10000 && value < 0x7FFF0000;
+}
+
+static unsigned int ReadU32(const void* base, unsigned int offset)
+{
+    const unsigned char* address = reinterpret_cast<const unsigned char*>(base) + offset;
+    if (!Plausible(base) || !Plausible(address)) return 0;
+    return *(const unsigned int*)address;
+}
+
+static void* ReadPtr(const void* base, unsigned int offset)
+{
+    return reinterpret_cast<void*>(ReadU32(base, offset));
+}
+
+static void* g_playerTemplate = nullptr;
+
+// Every game object the game spawns passes through the static
+// GameObjectSpawner::Create; remembering which template made which object
+// tells us the player's own template without ever resolving its name.
+struct SpawnRecord
+{
+    void* object;
+    void* tmpl;
+};
+
+static SpawnRecord g_spawns[4096];
+static volatile long g_spawnCount = 0;
+
+static void LookupPlayerTemplate(void* player)
+{
+    long count = g_spawnCount;
+    if (count > 4096) count = 4096;
+    for (long i = 0; i < count; ++i)
+    {
+        if (g_spawns[i].object == player)
+        {
+            g_playerTemplate = g_spawns[i].tmpl;
+            Log("tmpl: player %p is spawn %ld template=%p name=%08X%08X", player, i, g_playerTemplate,
+                ReadU32(g_playerTemplate, 0x14), ReadU32(g_playerTemplate, 0x10));
+            return;
+        }
+    }
+    Log("tmpl: player %p not in %ld spawns", player, count);
+}
+
+// Looks among the objects the mission already spawned for one whose template
+// carries that name hash, so the puppet can reuse a template known to render.
+static void* FindSpawnedTemplateByHash(unsigned int hash)
+{
+    long count = g_spawnCount;
+    if (count > 4096) count = 4096;
+    for (long i = 0; i < count; ++i)
+    {
+        void* tmpl = g_spawns[i].tmpl;
+        if (tmpl == nullptr) continue;
+        if (ReadU32(tmpl, 0x10) == hash)
+            return tmpl;
+    }
+    return nullptr;
+}
+
+// Same, but over every inventory the root holds: templates the mission has not
+// spawned yet only live there.
+static void* FindInventoryTemplateByHash(unsigned int hash)
+{
+    void* root = ReadPtr(g_engine, 0x1283818);
+    if (!Plausible(root)) return nullptr;
+    unsigned int inventoryVtable = ReadU32(root, 0);
+    void* inventories[160];
+    int inventoryCount = 0;
+    inventories[inventoryCount++] = root;
+    const unsigned int casterVtable = 0x10D95DB8;
+    using CastFn = void* (__thiscall*)(void*, void*);
+    struct Caster { void* vtable; };
+    CastFn cast = *reinterpret_cast<CastFn*>(casterVtable);
+    Caster caster;
+    caster.vtable = reinterpret_cast<void*>(casterVtable);
+    for (int index = 0; index < inventoryCount && index < 160; ++index)
+    {
+        void* inventory = inventories[index];
+        void* table = ReadPtr(inventory, 0x0C);
+        if (!Plausible(table)) continue;
+        unsigned int count = ReadU32(table, 0);
+        void** objects = reinterpret_cast<void**>(ReadPtr(table, 0x1C));
+        if (!Plausible(objects) || count > 20000) continue;
+        for (unsigned int i = 0; i < count; ++i)
+        {
+            void* object = objects[i];
+            if (!Plausible(object)) continue;
+            unsigned int vtable = ReadU32(object, 0);
+            if (vtable == inventoryVtable)
+            {
+                bool seen = false;
+                for (int k = 0; k < inventoryCount; ++k)
+                    if (inventories[k] == object) { seen = true; break; }
+                if (!seen && inventoryCount < 160) inventories[inventoryCount++] = object;
+                continue;
+            }
+            if (vtable < 0x10D00000 || vtable > 0x11200000) continue;
+            if (ReadU32(object, 0x10) != hash) continue;
+            void* tmpl = cast(&caster, object);
+            if (tmpl != nullptr)
+                return tmpl;
+        }
+    }
+    return nullptr;
+}
+
+static void SpawnPuppet()
+{
+    Log("spawn: begin pending=%d spawned=%d", g_spawnPending ? 1 : 0, g_puppetSpawned ? 1 : 0);
+    if (g_puppetSpawned || g_engine == nullptr) return;
+    void* inventory = *(void**)(reinterpret_cast<unsigned char*>(g_engine) + 0x1283818);
+    if (inventory == nullptr)
+    {
+        Log("spawn: gRootInventory is null");
+        return;
+    }
+    using SetPositionFn = void (__thiscall*)(void*, const float*);
+
+    void* tmpl = FindSpawnedTemplateByHash(0x2C48D34E); // "Soldier"
+    if (tmpl == nullptr)
+        tmpl = FindInventoryTemplateByHash(0x2C48D34E);
+    if (tmpl != nullptr)
+        Log("spawn: using Soldier template %p", tmpl);
+    if (tmpl == nullptr)
+    {
+        tmpl = FindSpawnedTemplateByHash(0xA5B3FA51); // "Brawler"
+        if (tmpl == nullptr)
+            tmpl = FindInventoryTemplateByHash(0xA5B3FA51);
+        if (tmpl != nullptr)
+            Log("spawn: using Brawler template %p", tmpl);
+    }
+    if (tmpl == nullptr)
+        tmpl = g_playerTemplate;
+    Log("spawn: player template = %p", tmpl);
+    if (tmpl == nullptr)
+    {
+        g_puppetSpawned = true;
+        return;
+    }
+    using SpawnFn = void* (__cdecl*)(void*, const void*, void*, void*, bool);
+    using NameCtorFn = void (__thiscall*)(void*, const char*);
+    unsigned long long objectName = 0;
+    reinterpret_cast<NameCtorFn>(g_nameCtor)(&objectName, "coop_puppet");
+    Log("spawn: object name=%08X%08X", (unsigned int)(objectName >> 32), (unsigned int)objectName);
+    void* object = reinterpret_cast<SpawnFn>(g_createObject)(tmpl, &objectName, inventory, nullptr, true);
+    Log("spawn: object = %p vtable=%08X", object, object != nullptr ? *(unsigned int*)object : 0);
+    if (object == nullptr)
+    {
+        g_puppetSpawned = true;
+        return;
+    }
+    float position[3] = { g_remoteX + 2.0f, g_remoteY, g_remoteZ };
+    reinterpret_cast<SetPositionFn>(g_setPosition)(object, position);
+    // GameObject::GetHandle returns the handle through a hidden pointer, so build
+    // it from the object's slot index and the generation in the master table.
+    unsigned short objectIndex = *(unsigned short*)(reinterpret_cast<unsigned char*>(object) + 0x58);
+    unsigned int tableAddress = ReadU32(g_engine, 0x128348c);
+    unsigned short generation = 0;
+    if (objectIndex != 0xFFFF && Plausible(reinterpret_cast<void*>(tableAddress)))
+        generation = *(unsigned short*)(tableAddress + objectIndex * 8 + 4);
+    unsigned int handle = objectIndex | (generation << 16);
+    *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = handle;
+    g_puppetObject = object;
+    void* player1 = g_getPlayerObject ? g_getPlayerObject(1) : nullptr;
+    Log("spawn: index=%u gen=%u handle=%08X p1=%p at %.1f %.1f %.1f", objectIndex, generation, handle,
+        player1, position[0], position[1], position[2]);
+    g_puppetSpawned = true;
+}
+
 
 static void* __thiscall HookOpen(void* self, unsigned char kind, unsigned int a, unsigned int b)
 {
@@ -318,9 +572,56 @@ static void __cdecl HookUpdateSync()
         Log("players p0=%p p1=%p handles=%08X/%08X", player0, player1,
             *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E40C),
             *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410));
+        if (!g_isHost && player0 != nullptr && !g_puppetSpawned)
+        {
+            if (!g_attrDumped)
+            {
+                g_attrDumped = true;
+                DumpAttributes(player0);
+            }
+            LookupPlayerTemplate(player0);
+            if (g_playerTemplate != nullptr)
+                g_spawnPending = true;
+        }
+        if (g_puppetObject != nullptr)
+        {
+            float px = 0.0f, py = 0.0f, pz = 0.0f;
+            float qx = 0.0f, qy = 0.0f, qz = 0.0f;
+            bool playerOk = ReadObjectPosition(player0, &px, &py, &pz);
+            bool puppetOk = ReadObjectPosition(g_puppetObject, &qx, &qy, &qz);
+            Log("puppet: player=%d %.2f %.2f %.2f puppet=%d %.2f %.2f %.2f", playerOk ? 1 : 0, px, py, pz,
+                puppetOk ? 1 : 0, qx, qy, qz);
+        }
     }
     g_updateCalls++;
     g_updateSync();
+    if (g_isHost && g_testMove && !g_testMoved && g_updateCalls > 6000)
+    {
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        if (ReadPlayerPosition(&x, &y, &z))
+        {
+            SetObjectPosition(g_getPlayerObject(0), x + 6.0f, y, z);
+            Log("test: moved host player to %.2f %.2f %.2f", x + 6.0f, y, z);
+            g_testMoved = true;
+        }
+    }
+    if (g_spawnPending && !g_puppetSpawned)
+        SpawnPuppet();
+    if (g_puppetObject != nullptr && (g_updateCalls % 2) == 0)
+    {
+        float x = g_remoteX + 2.0f, y = g_remoteY, z = g_remoteZ;
+        if (g_localOffsetTest)
+        {
+            float px = 0.0f, py = 0.0f, pz = 0.0f;
+            if (ReadPlayerPosition(&px, &py, &pz))
+            {
+                x = px + 3.0f;
+                y = py;
+                z = pz;
+            }
+        }
+        SetObjectPosition(g_puppetObject, x, y, z);
+    }
 }
 
 static void* __cdecl HookApplySync(const unsigned int* machines, int type, const void* message)
@@ -338,6 +639,10 @@ static void* __cdecl HookApplySync(const unsigned int* machines, int type, const
         memcpy(&sy, bytes + 4, 2);
         memcpy(&sz, bytes + 6, 2);
         Log("transform client %.2f %.2f %.2f", sx / 32.0f, sy / 32.0f, sz / 32.0f);
+        g_remoteX = sx / 32.0f;
+        g_remoteY = sy / 32.0f;
+        g_remoteZ = sz / 32.0f;
+        g_remoteValid = true;
         return nullptr;
     }
     if (g_applyCalls < 40)
@@ -359,6 +664,30 @@ static bool Install(const char* name, void* target, void* detour, void** origina
     }
     Log("hook %s target=%p", name, target);
     return true;
+}
+
+// Every game object the game spawns passes through the static
+// GameObjectSpawner::Create; remembering which template made which object
+// tells us the player's own template without ever resolving its name.
+static void* g_sampledTemplate = nullptr;
+using CreateSpawnedFn = void* (__cdecl*)(void*, const void*, int, void*, void*, bool);
+static CreateSpawnedFn g_createSpawned = nullptr;
+
+static void* __cdecl HookCreateSpawned(void* tmpl, const void* name, int heap, void* inventory, void* target, bool flag)
+{
+    void* object = g_createSpawned(tmpl, name, heap, inventory, target, flag);
+    long index = InterlockedIncrement(&g_spawnCount) - 1;
+    if (index >= 0 && index < 4096)
+    {
+        g_spawns[index].object = object;
+        g_spawns[index].tmpl = tmpl;
+    }
+    if (index < 60)
+        Log("spawned[%ld] tmpl=%p name=%08X%08X object=%p vtable=%08X", index, tmpl,
+            name != nullptr ? *(const unsigned int*)((const unsigned char*)name + 4) : 0,
+            name != nullptr ? *(const unsigned int*)name : 0,
+            object, object != nullptr ? *(unsigned int*)object : 0);
+    return object;
 }
 
 static void InstallHooks()
@@ -384,8 +713,17 @@ static void InstallHooks()
     Install("StartSync", At<void*>(0x00833380), (void*)&HookStartSync, (void**)&g_startSync);
     Install("UpdateSync", At<void*>(0x008336F0), (void*)&HookUpdateSync, (void**)&g_updateSync);
     Install("ApplySyncMessage", At<void*>(0x00833450), (void*)&HookApplySync, (void**)&g_applySync);
+    Install("GameObjectSpawner::Create", At<void*>(0x007F25C0), (void*)&HookCreateSpawned, (void**)&g_createSpawned);
     g_sendSyncMessage = At<SendSyncMessageFn>(0x00833790);
     g_getPlayerObject = At<GetPlayerObjectFn>(0x00099560);
+    g_findTemplate = At<void*>(0x00374650);
+    g_createObject = At<void*>(0x007F2740);
+    g_setPosition = At<void*>(0x007E08E0);
+    g_getHandle = At<void*>(0x007EEF60);
+    g_findAttribute = At<void*>(0x007E0C00);
+    g_getText = At<void*>(0x0027F1A0);
+    g_createObject = At<void*>(0x007F2710);
+    g_nameCtor = At<void*>(0x0005D5E0);
 
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
         Log("MH_EnableHook failed");
