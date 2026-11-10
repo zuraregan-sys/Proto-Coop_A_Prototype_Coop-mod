@@ -52,7 +52,7 @@ For the first test both roles run on one PC, so `peer=127.0.0.1` and different p
 
 ## Milestones
 
-1. **Loopback sync:** both instances exchange `SyncMessage`s; the engine's `gSyncConnection` is our channel.
+1. **Loopback sync:** both instances exchange `SyncMessage`s; the engine's `gSyncConnection` is our channel. **Diagnostic heartbeat works** (host -> client through the engine's `UpdateSync` path). Next: use the real `SendSyncMessage`/`ApplySyncMessage` payloads, not the test heartbeat.
 2. **Remote avatar:** spawn a second player object / puppet using the engine's player handles.
 3. **Free-roam combat:** host owns enemies; damage/death events.
 4. **Story:** mission/flag sync.

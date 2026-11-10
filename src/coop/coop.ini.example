@@ -1,0 +1,6 @@
+; Prototype co-op test config. Copy next to prototype_coop.asi.
+; For two instances on one PC use host/client with different ports.
+[coop]
+role=host
+port=27016
+peer_port=27017
