@@ -85,6 +85,7 @@ using StartSyncFn = void (__cdecl*)(void*, int, int);
 using UpdateSyncFn = void (__cdecl*)();
 using ApplySyncFn = void* (__cdecl*)(const unsigned int*, int, const void*);
 using SendSyncMessageFn = void (__cdecl*)(int, const void*);
+using GetPlayerObjectFn = void* (__cdecl*)(int);
 
 
 static OpenFn g_open = nullptr;
@@ -95,6 +96,7 @@ static StartSyncFn g_startSync = nullptr;
 static UpdateSyncFn g_updateSync = nullptr;
 static ApplySyncFn g_applySync = nullptr;
 static SendSyncMessageFn g_sendSyncMessage = nullptr;
+static GetPlayerObjectFn g_getPlayerObject = nullptr;
 
 static void ReadConfig()
 {
@@ -259,6 +261,14 @@ static void __cdecl HookUpdateSync()
         StartFakeSession();
     if (g_started && g_isHost && (g_updateCalls % 60) == 0)
         SendHeartbeat();
+    if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
+    {
+        void* player0 = g_getPlayerObject(0);
+        void* player1 = g_getPlayerObject(1);
+        Log("players p0=%p p1=%p handles=%08X/%08X", player0, player1,
+            *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E40C),
+            *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410));
+    }
     g_updateCalls++;
     g_updateSync();
 }
@@ -315,6 +325,7 @@ static void InstallHooks()
     Install("UpdateSync", At<void*>(0x008336F0), (void*)&HookUpdateSync, (void**)&g_updateSync);
     Install("ApplySyncMessage", At<void*>(0x00833450), (void*)&HookApplySync, (void**)&g_applySync);
     g_sendSyncMessage = At<SendSyncMessageFn>(0x00833790);
+    g_getPlayerObject = At<GetPlayerObjectFn>(0x00099560);
 
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
         Log("MH_EnableHook failed");
