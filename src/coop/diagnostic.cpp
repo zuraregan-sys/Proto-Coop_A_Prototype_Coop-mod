@@ -24,6 +24,10 @@ static bool g_hooksReady = false;
 
 struct FakeChannelManager { unsigned char pad[4]; };
 struct FakeChannel { unsigned int pad; };
+struct FakeNetSystem
+{
+    unsigned char pad[0x24];
+};
 struct FakeSyncOwner
 {
     unsigned char pad[0x20];
@@ -34,6 +38,7 @@ struct FakeSyncOwner
 
 static FakeChannelManager g_fakeChannelManager;
 static FakeChannel g_fakeChannel;
+static FakeNetSystem g_fakeNetSystem;
 static FakeSyncOwner g_fakeOwner;
 static int g_peerMask = 2;
 
@@ -79,6 +84,8 @@ using ReceiveFn = const char* (__thiscall*)(void*, char*, int, unsigned int*, un
 using StartSyncFn = void (__cdecl*)(void*, int, int);
 using UpdateSyncFn = void (__cdecl*)();
 using ApplySyncFn = void* (__cdecl*)(const unsigned int*, int, const void*);
+using SendSyncMessageFn = void (__cdecl*)(int, const void*);
+
 
 static OpenFn g_open = nullptr;
 static CloseFn g_close = nullptr;
@@ -87,6 +94,7 @@ static ReceiveFn g_receive = nullptr;
 static StartSyncFn g_startSync = nullptr;
 static UpdateSyncFn g_updateSync = nullptr;
 static ApplySyncFn g_applySync = nullptr;
+static SendSyncMessageFn g_sendSyncMessage = nullptr;
 
 static void ReadConfig()
 {
@@ -143,9 +151,18 @@ static void SendHeartbeat()
     unsigned char packet[8] = { 'P', 'C', 'O', 'P', 0, 0, 0, 0 };
     ++g_heartbeat;
     memcpy(packet + 4, &g_heartbeat, sizeof(g_heartbeat));
+    void* netSystem = nullptr;
+    if (g_engine != nullptr)
+        netSystem = *(void**)(reinterpret_cast<unsigned char*>(g_engine) + 0x13187D4);
+    if (g_sendSyncMessage != nullptr && netSystem != nullptr)
+    {
+        g_sendSyncMessage(0, packet);
+        Log("heartbeat via SendSyncMessage %u", g_heartbeat);
+        return;
+    }
     int sent = sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
     if (sent == sizeof(packet))
-        Log("heartbeat sent %u", g_heartbeat);
+        Log("heartbeat direct %u", g_heartbeat);
     else
         Log("heartbeat send failed: %d", WSAGetLastError());
 }
@@ -229,6 +246,8 @@ static void StartFakeSession()
     memset(&g_fakeOwner, 0, sizeof(g_fakeOwner));
     g_fakeOwner.machines = 3;
     g_fakeOwner.session = &g_fakeChannelManager;
+    memset(&g_fakeNetSystem, 0, sizeof(g_fakeNetSystem));
+    *(void**)(reinterpret_cast<unsigned char*>(g_engine) + 0x13187D4) = &g_fakeNetSystem;
     g_started = true;
     Log("starting fake session");
     g_startSync(&g_fakeOwner, 0x2000, 100);
@@ -295,6 +314,7 @@ static void InstallHooks()
     Install("StartSync", At<void*>(0x00833380), (void*)&HookStartSync, (void**)&g_startSync);
     Install("UpdateSync", At<void*>(0x008336F0), (void*)&HookUpdateSync, (void**)&g_updateSync);
     Install("ApplySyncMessage", At<void*>(0x00833450), (void*)&HookApplySync, (void**)&g_applySync);
+    g_sendSyncMessage = At<SendSyncMessageFn>(0x00833790);
 
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK)
         Log("MH_EnableHook failed");
