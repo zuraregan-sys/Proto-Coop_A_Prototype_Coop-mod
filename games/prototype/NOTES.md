@@ -44,11 +44,20 @@
 
 ## Next steps
 
-1. Open a claim issue in `cranebeaker/coop-anything`.
-2. Set up two isolated instances (hard links, private saves) and confirm both launch.
+1. Open a claim issue in `cranebeaker/coop-anything`. **Done: #353.**
+2. Set up two isolated instances (hard links, private saves) and confirm both launch. **Done: both instances 0 and 1 launched concurrently and stayed alive with normal windows.** Starting them minimized produced a crash in `prototypeenginef.dll` at offset `0x615feb` (`0xc0000005`); launch them with normal windows.
 3. Trace `CreateOnlineManager` / `gOnlineManager+0x70` and `NetSession` in the retail DLL (read-only).
 4. Build a loopback session shim; get `SyncObject` messages across two clients.
 5. Spawn a remote puppet; then shared combat.
+
+## Verified so far
+
+- Game copy hashes match the known build.
+- Two isolated instances run at the same time on this PC (Ryzen 5 4500 / RTX 2060 Super).
+- No co-op session yet; both instances are independent.
+- Minimized launch is not safe; use normal windows for tests.
+- Saves are backed up under `local/save-backup-2026-11-10` and the harness protects `%USERPROFILE%\Documents\Prototype`.
+
 
 ## Sources
 
