@@ -15,11 +15,44 @@
 1. **El decomp global está al 53,482 % de funciones** (75.061 / 140.347) y al **31,059 % de bytes** de código. Es un proyecto de decompilación “matching”, no un port funcional.
 2. **El subsistema online está mucho menos reconstruido que el resto.** El propio worklist marca como **no hecha** la capa de red (`ConsoleManager`, `Channel`, `MultiTailQueue`, sync; ~270 funciones) y también `OLSPeer`, `ConsoleManagerPeer`, `SyncManager` y `DesyncHunterOnline`. Sin esa capa, el online no funciona.
 3. **Lo más aprovechable es `SyncObject`** (sincronización de inputs press/release), junto con `DesyncHunter`/`DesyncChecker` y la clase `Replay`. Son piezas relativamente autocontenidas y bien documentadas, pero **no están cableadas**: no hay llamadores reconstruidos de `StartSync`/`UpdateSync`, y `ApplySyncMessage` está en `NONMATCHING` (62 %).
-4. **`CoOpBehaviour` existe, pero es solo el cascarón:** están reconstruidos `ClassInfo`, constructor, `Slot1` y `GetMembers`; **faltan `Update` (0x104DB8E0), `OnMessage` (0x104DB980) y el destructor (0x104DB960)**, además de los layouts de `RespawnState`, `PlayerDeadState` y `PairingVolumeState` y varios mensajes `CoOpMessage`.
-5. **Sí existe una abstracción de transporte:** `engine::NetSession` / `engine::NetConnection` (`Open`, `Close`, `Send`, `Receive`, `IsReady`), usada por `SyncObject` y por `GameLinkManager`. Pero **solo está declarada**; su implementación está en la capa de red no reconstruida. Es el mejor “seam” para sustituir Quazal, pero no evita implementar sesión/lobby/semántica de canales.
+4. **`CoOpBehaviour` está reconstruido solo en parte en la fuente, pero el binario sí tiene la lógica completa.** Ghidra recuperó `Update` (0x104DB8E0), `OnMessage` (0x104DB980) y el destructor (0x104DB960); es un state machine pequeño para respawn/pairing/muerte. Sigue siendo la pieza más fácil de reimplementar.
+5. **La abstracción de transporte real es `ChannelManager` / `Channel`**, no `NetSession`/`NetConnection`: esos nombres de `gamelink.h` son suposiciones. `OnlineManager+0x70` contiene un `ChannelManager`; `ChannelManager::Open` crea `MultiTailQueue` y `Channel`. Esa capa es exactamente la que el decomp marca como no reconstruida, pero la interfaz es pequeña y sustituible.
 6. **`CoOpBehaviour` no depende directamente de `OnlineManager`** en el código reconstruido. Conceptualmente podría funcionar en local/loopback si se reconstruyen sus métodos y se inyectan mensajes, pero **no funciona tal cual** y no aporta red por sí solo.
 7. **Licencia:** `prototype_decomp License v1`, source-only, **no comercial**, sin archivos originales, sin distribución de binarios que contengan el programa original, atribución y misma licencia para forks. Además, la regla de este proyecto prohíbe copiar código de terceros: debe usarse como referencia, no como código pegado.
-8. **Siguiente paso recomendado:** trazar el arranque online (`CreateOnlineManager` → `gOnlineManager` → sesión en `+0x70`) y reversar el seam `NetSession`/`NetConnection` antes de invertir en `CoOpBehaviour` o en la UI.
+8. **Siguiente paso recomendado:** mapear `ChannelManager`/`Channel`/`ConsoleManagerPeer`, decidir si se hookea el bootstrap de sesión `FUN_108BF1B0` o se sustituye `ChannelManager` en `OnlineManager+0x70`, y probar loopback. `CreateOnlineManager` (0x104A29E0) **no** es el punto de entrada online: es el `SoundManager`.
+
+---
+
+## 0.b Addendum — verificación con Ghidra (2026-11-10)
+
+Después de la auditoría documental se importó la DLL en Ghidra 12.1.4 y se decompilaron las funciones clave. Esto **corrige** varias suposiciones del informe original:
+
+| Afirmación original | Corrección verificada |
+|---|---|
+| `0x104A29E0` = `CreateOnlineManager` | Falso. Es el constructor de `SoundManager` (800 bytes, registros `snd_*`). El nombre del decomp es erróneo. |
+| `OnlineManager+0x70` = `ChannelManager*` (header) / `NetSession*` (gamelink) | Es un **`ChannelManager`**. `gamelink.h` llama `NetSession` por error. |
+| La abstracción es `NetSession`/`NetConnection` | Son **`ChannelManager`/`Channel`**; `ChannelManager::Open` crea `MultiTailQueue` y `Channel`. |
+| `StartSync` no tenía llamadores | `FUN_108BF1B0` (bootstrap de sesión) lo llama. |
+| `UpdateSync` no tenía llamadores | `SimulationTick` (0x10838BA0) lo llama. |
+| `CoOpBehaviour` sin lógica | Ghidra recuperó `Update`, `OnMessage` y destructor; la lógica es pequeña y completa. |
+
+**Arranque real:**
+
+- `EngineInitialize` (0x1085EFB0) → `FUN_108BF5E0` (0x1085F47E): inicializa el subsistema online, crea `OnlineManager` (0x9C) y `OnlineSync` (0x144).
+- `OLSPeer` ctor (0x108E7E80) → `FUN_108BF1B0`: bootstrap de sesión host/cliente.
+- `FUN_108BF1B0` crea `ChannelManager` (0x7C) en `OnlineManager+0x70`, `ConsoleManagerPeer` (0x8C) en `+0x74`, abre dos canales en `+0x94`/`+0x98`, instala el `OnlineManager` como `SimulationDriver`, inicializa `OnlineSync`, llama `StartSync` y crea `DesyncHunterOnline`.
+- `OnlineManager::Slot4` (0x108BF780) es el pump de red: actualiza reloj, envía cola, recibe del canal y despacha a `OnlineSync`.
+
+**`CoOpBehaviour` recuperado:**
+
+- `Update` (0x104DB8E0): avanza los tres estados y emite evento 4.
+- `OnMessage` (0x104DB980): tipo 2 y tipo `0x30` ids 0..4; crea perezosamente `RespawnState` (0xC), `PlayerDeadState` (8) y `PairingVolumeState` (0x10); activa/consulta bits por jugador y dispara eventos.
+- Tamaño 0x18; campos en +0xC, +0x10, +0x14; el creator `0x10294380` asigna 0x18 y llama al ctor.
+
+Estas correcciones tienen prioridad sobre las secciones 3, 7, 8 y 11 cuando haya conflicto de nombres.
+
+---
+
 
 ---
 
@@ -381,42 +414,43 @@ Esto convierte `OnlineManager+0x70` en el punto más prometedor para instalar un
 
 ### 7.1 Respuesta corta
 
-**Sí, a nivel de `engine::NetSession` / `engine::NetConnection`.**  
+**Sí, a nivel de `ChannelManager` / `Channel`** (los nombres `NetSession`/`NetConnection` de `gamelink.h` son suposiciones).  
 **No, a nivel de `OLS`/Quazal completo.**
 
 ### 7.2 Detalle
 
-**[HECHO]** La interfaz declarada es pequeña:
+**[HECHO]** Ghidra confirma que `OnlineManager+0x70` es un `ChannelManager` (0x7C bytes), creado en `FUN_108BF1B0`. Su método `Open` (0x108C31D0) crea entradas de 0x28 bytes, un `MultiTailQueue` (0x18) y un `Channel` (4). El valor devuelto se usa como conexión para `Send`/`Receive`.
 
-- `NetSession::Open(kind, unknown, capacity)` → `NetConnection*`
-- `NetSession::Close(NetConnection*)`
-- `NetConnection::Send(target, channel, data, length, unknown)`
-- `NetConnection::Receive(buffer, capacity, &length, &flag, &source)`
-- `NetConnection::IsReady()`
+**[HECHO]** La interfaz observada es pequeña:
+
+- `ChannelManager::Open(kind, unknown, capacity)` → `Channel*`
+- `Channel::Send(target, channel, data, length, unknown)`
+- `Channel::Receive(buffer, capacity, &length, &flag, &source)`
+- `Channel::IsReady()`
 - `NetSystem` con `unknown20` como `target`
 
 **[HECHO]** Usos conocidos:
 
-- `SyncObject::StartSync` abre kind **4**.
-- `SyncObject::SendSyncMessage` usa `target = GetNetSystem()->unknown20`, `channel = type`, 8 bytes, flag 1.
-- `SyncObject::UpdateSync` drena `Receive` y usa `source` como máscara de máquinas.
+- `StartSync` (0x10833380) abre kind **4** y guarda el `Channel*` en `gSyncConnection`.
+- `SendSyncMessage` usa `target = GetNetSystem()->unknown20`, `channel = type`, 8 bytes, flag 1.
+- `UpdateSync` drena `Receive` y usa `source` como máscara de máquinas.
 - `GameLinkManager::Connect` abre kind **6**, canal `0xFF`; usa `Receive`/`Send`.
 
-**[HECHO]** Las implementaciones de `NetSession`/`NetConnection` **no están en el repo**; solo están declaradas y mapeadas. La capa `ConsoleManager`/`Channel`/`MultiTailQueue`/`LoopbackConnection`/`ChannelConnection` (0x10900260–0x10905A00 y 0x108C2F60–0x108C5870) está **no reconstruida**.
+**[HECHO]** Las implementaciones de `ChannelManager`/`Channel` **no están reconstruidas**; el worklist marca `ConsoleManager`, `Channel` y `MultiTailQueue` como no hechos (~270 funciones, 0x108C2F60–0x108C5870 y 0x108C7210–0x108C8D20).
 
 ### 7.3 Implicación
 
-**[HIPÓTESIS]** Se puede escribir un `NetSession`/`NetConnection` propio sobre UDP/Steam y instalarlo en `OnlineManager+0x70` (o interceptar `NetSession::Open`) para que `SyncObject` y `GameLinkManager` funcionen sin Quazal. Eso evita reconstruir el backend Quazal y permite conservar `SyncObject`, `Replay` y `DesyncHunter`.
+**[HIPÓTESIS]** Se puede escribir un `ChannelManager`/`Channel` propio sobre UDP/Steam e instalarlo en `OnlineManager+0x70` (o interceptar `ChannelManager::Open`) para que `SyncObject` y `GameLinkManager` funcionen sin Quazal. Eso evita reconstruir el backend Quazal y permite conservar `SyncObject`, `Replay` y `DesyncHunter`.
 
 Pero **no evita**:
 
 - implementar la semántica de `kind` 4/6, `target`, `channel`, flags y `source`;
-- crear/destruir la sesión y el lobby;
+- crear/destruir la sesión y el lobby (`ConsoleManagerPeer`/`OLSPeer`);
 - sustituir `OnlineClock`/`OnlineSync` para las transiciones de estado;
-- reconstruir `CoOpBehaviour` y los mensajes;
+- reimplementar `CoOpBehaviour` y los mensajes;
 - decidir si `OLSGame`/`OLSUserList` se usan o se puentean.
 
-**Conclusión:** el seam `NetSession` es la vía más realista para **evitar Quazal**, no para evitar todo el sistema online.
+**Conclusión:** el seam `ChannelManager`/`Channel` es la vía más realista para **evitar Quazal**, no para evitar todo el sistema online.
 
 ---
 
@@ -428,27 +462,29 @@ Pero **no evita**:
 |---|---|---|
 | `0x1085EFB0` | `EngineInitialize` (export) | Bootstrap temprano del plugin; conoce los argumentos de lanzamiento |
 | `0x1085EB20` | `EngineService` (export) | Bucle principal; ya usado por otros proyectos |
-| `0x104A29E0` | `proto::CreateOnlineManager` | **Hook de arranque**: interceptar la creación del gestor online |
-| `0x11318530` | `gOnlineManager` (global) | Acceso al gestor; `+0x70` es la sesión |
+| `0x108BF5E0` | Init del subsistema online (llamada desde `EngineInitialize` en `0x1085F47E`) | **Hook real de arranque**: crea `OnlineManager` y `OnlineSync` |
+| `0x108E7E80` | `OLSPeer` constructor | Entrada del host/join; llama al bootstrap de sesión |
+| `0x108BF1B0` | Bootstrap de sesión host/cliente | **Hook principal**: crea `ChannelManager`, `ConsoleManagerPeer`, canales, `StartSync` y `DesyncHunterOnline` |
+| `0x11318530` | `gOnlineManager` (global) | Acceso al gestor; `+0x70` es el `ChannelManager` |
 | `0x108BF160` | `OnlineManager` constructor | Sustituir/envolver el driver online |
-| `0x108BF780` | `OnlineManager::Slot4` | Stepping online; faltante |
-| `0x108BF520` | `OnlineManager::UpdateClock` | Reloj online; faltante |
+| `0x108BF780` | `OnlineManager::Slot4` | **Pump de red**: reloj, envío, recepción y dispatch |
+| `0x108BF520` | `OnlineManager::UpdateClock` | Reloj online |
 | `0x108BF690` | `OnlineManager::Shutdown` | Cierre de sesión |
-| `0x108C31D0` | `NetSession::Open` | **Seam de transporte**: interceptar kind 4/6 |
-| `0x108C3F90` | `NetConnection::Send` | Enviar por transporte propio |
-| `0x108C4030` | `NetConnection::Receive` | Recibir por transporte propio |
-| `0x108C40C0` | `NetConnection::IsReady` | Estado de conexión |
-| `0x10833380` | `StartSync` | Iniciar sync de inputs; abrir conexión kind 4 |
+| `0x108C31D0` | `ChannelManager::Open` | **Seam de transporte**: interceptar kind 4/6 |
+| `0x108C3F90` | `Channel::Send` | Enviar por transporte propio |
+| `0x108C4030` | `Channel::Receive` | Recibir por transporte propio |
+| `0x108C40C0` | `Channel::IsReady` | Estado de conexión |
+| `0x10833380` | `StartSync` | Iniciar sync de inputs; abre kind 4 |
 | `0x108333D0` | `StopSync` | Cerrar sync |
 | `0x10833790` | `SendSyncMessage` | Enviar press/release |
-| `0x108336F0` | `UpdateSync` | Drenar mensajes de sync |
+| `0x108336F0` | `UpdateSync` | Drenar mensajes de sync (llamado desde `SimulationTick`) |
 | `0x10833450` | `ApplySyncMessage` | Aplicar mensaje de sync (NONMATCHING) |
-| `0x108C7340` | `OnlineClock::GetTime` | Reloj de red; faltante |
+| `0x108C7340` | `OnlineClock::GetTime` | Reloj de red (implementado en el binario) |
 | `0x108C7750` | `OnlineSync` accessor | Sincronización de transiciones de estado |
 | `0x108C7B50` / `0x108C7BE0` / `0x108C7820` | `OnlineSync` methods | Inicio/fin/consulta de transición |
 | `0x104DAEC0` | `CoOpBehaviour` constructor | Crear el comportamiento en un GameObject |
-| `0x104DB8E0` | `CoOpBehaviour::Update` | Lógica por frame; faltante |
-| `0x104DB980` | `CoOpBehaviour::OnMessage` | Manejo de mensajes co-op; faltante |
+| `0x104DB8E0` | `CoOpBehaviour::Update` | Lógica por frame; recuperada con Ghidra |
+| `0x104DB980` | `CoOpBehaviour::OnMessage` | Manejo de mensajes co-op; recuperado con Ghidra |
 | `0x10294380` | `MetaBehaviourCreatorImpl<CoOpBehaviour>::CreateBehaviour` | Crear instancia desde el sistema de behaviours |
 | `0x1029BA60` | `RegisterMetaBehaviourCreator<CoOpBehaviour>` | Registro de la factoría |
 | `0x10821520`–`0x10821560` | `DesyncHunter` statics | Arrancar/parar/actualizar QA |
@@ -459,7 +495,7 @@ Pero **no evita**:
 | `0x108441E0` | `OLS::Get` | Acceso al singleton OLS |
 | `0x10887DA0` | `OLSGame::TryRequestState` | Flujo de estado de sesión |
 
-**Nota:** `CreateOnlineManager` y `CoOpBehaviour::Update/OnMessage` no tienen cuerpo reconstruido; las direcciones son válidas en `symbols.txt`, pero su comportamiento debe confirmarse contra el binario antes de hookear.
+**Nota:** `0x104A29E0` es `SoundManager`, no online. `CoOpBehaviour::Update/OnMessage` no estaban en la fuente, pero sí en el binario y ya se recuperaron con Ghidra.
 
 ---
 
@@ -512,16 +548,15 @@ Pero **no evita**:
 
 ## 11. Cinco siguientes objetivos de investigación (por prioridad)
 
-### 1. Trazar el arranque online y la creación de la sesión
+### 1. Trazar el arranque online y la creación de la sesión — **resuelto con Ghidra**
 
-**Pregunta:** ¿`CreateOnlineManager` (0x104A29E0) crea `OnlineManager` en single-player? ¿Quién escribe `OnlineManager+0x70` (la sesión)? ¿`OLS` se instancia siempre?  
-**Método:** leer `CreateOnlineManager` y sus llamadores en Ghidra; seguir `gOnlineManager` (0x11318530) y `gOLS`; comparar con `protomain.cpp:414`.  
-**Criterio de salida:** diagrama de inicialización con el momento exacto en que existe una `NetSession` y si está activa en SP.
+**Hecho:** `EngineInitialize` → `0x108BF5E0` inicializa `OnlineManager` y `OnlineSync`; `OLSPeer` (0x108E7E80) → `0x108BF1B0` arranca la sesión host/cliente. `0x104A29E0` es `SoundManager`, no online.  
+**Pendiente:** confirmar en ejecución cuándo `OLSPeer` se instancia en single-player y si `0x108BF1B0` se llama sin sesión.
 
-### 2. Reversar el seam `NetSession`/`NetConnection`
+### 2. Reversar el seam `ChannelManager`/`Channel`
 
 **Pregunta:** ¿qué semántica tienen `kind` 4/6, `target`, `channel`, `flag` y `source`? ¿Se puede implementar un shim sobre UDP/Steam que satisfaga a `SyncObject` y `GameLinkManager`?  
-**Método:** `NetSession::Open` 0x108C31D0, `NetConnection::Send` 0x108C3F90, `Receive` 0x108C4030, `IsReady` 0x108C40C0, `GetNetSystem` 0x108C4260; comparar con `GameLinkManager::Connect` (kind 6) y `StartSync` (kind 4).  
+**Método:** `ChannelManager::Open` 0x108C31D0, `Channel::Send` 0x108C3F90, `Receive` 0x108C4030, `IsReady` 0x108C40C0, `GetNetSystem` 0x108C4260; comparar con `GameLinkManager::Connect` (kind 6) y `StartSync` (kind 4).  
 **Criterio de salida:** especificación de la interfaz y un test de loopback de 8 bytes (mensaje `SyncMessage`).
 
 ### 3. Reconstruir la lógica de `CoOpBehaviour`
@@ -546,7 +581,7 @@ Pero **no evita**:
 
 ## 12. Limitaciones de esta auditoría
 
-- **No se inspeccionó el binario retail directamente** (no hay DLL/EXE en el repo y no se abrió Ghidra). Las direcciones, estados y nombres provienen de `config/PROTOPC_2025/symbols.txt`, `classes.tsv`, `rtti.tsv`, `docs/engine_worklist.md` y el código fuente del repo.
+- **Auditoría inicial basada en el repositorio; el addendum 0.b sí inspeccionó el binario con Ghidra 12.1.4.** Las direcciones, estados y nombres originales provienen de `config/PROTOPC_2025/symbols.txt`, `classes.tsv`, `rtti.tsv`, `docs/engine_worklist.md` y el código fuente del repo; el addendum corrige los nombres que el binario desmiente.
 - **No se compiló ni ejecutó** el proyecto; no se probó el híbrido ni una sesión de dos clientes.
 - **No se pudieron inspeccionar** (no están en el repo):
   - `ConsoleManager`, `Channel`, `MultiTailQueue`, `LoopbackConnection`, `ChannelConnection`.
