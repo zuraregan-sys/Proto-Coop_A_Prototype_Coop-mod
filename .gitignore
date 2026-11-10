@@ -1,0 +1,25 @@
+# Game files and assets: never commit
+/Prototype/
+/TestInstances/
+
+# Owner-private state
+/local/
+
+# Build and tool output
+/build/
+/dist/
+/tools/bin/
+*.log
+*.dmp
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.dll
+*.exe
+
+# Environment and editor files
+.env
+.env.*
+.vscode/
+.idea/
