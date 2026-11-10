@@ -1,0 +1,19 @@
+
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "model": "opencode-go/deepseek-v4.1-flash",
+
+  "mcp": {
+    "coop-anything": {
+      "type": "local",
+      "command": [
+        "py",
+        "D:\\AI\\coop-anything\\tools\\mcp\\coop_mcp.py"
+      ],
+      "cwd": "D:\\AI\\coop-anything",
+      "enabled": true,
+      "timeout": 60000
+    }
+  }
+}
