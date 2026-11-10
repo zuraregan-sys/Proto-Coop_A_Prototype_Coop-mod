@@ -84,6 +84,7 @@ Ghidra 12.1.4 (official zip, SHA-256 pinned) and capstone were installed under `
 - Minimized launch is not safe; use normal windows for tests.
 - Saves are backed up under `local/save-backup-2026-11-10` and the harness protects `%USERPROFILE%\Documents\Prototype`.
 - **Milestone 1 (transport loopback) works:** the ASI diagnostic hooks `ChannelManager::Open`, `Channel::Send`, `Channel::Receive`, `StartSync`, `UpdateSync` and `ApplySyncMessage`. A fake `SyncOwner` starts the engine's sync, the host sends 8-byte `PCOP` heartbeats through the engine's `SendSyncMessage` -> `Channel::Send`, and the client receives them through `UpdateSync` -> `Channel::Receive` -> `ApplySyncMessage`. Host sent 13; client logged 8 received. `GetNetSystem` is null in single-player, so the plugin installs a fake `NetSystem` with `unknown20 = 0`; without that, `SendSyncMessage` cannot resolve a target.
+- The engine's real `SendSyncMessage` path is now exercised: the log shows `fake Channel::Send target=0 type=0 len=8 flag=1` followed by `heartbeat via SendSyncMessage`.
 - No game crash from the hooks; the host later exited by `TimedExit`.
 - Build: `build/coop/prototype_coop.asi` (PE32, exports `InitializeASI`), built with llvm-mingw 2026-11-04 + MinHook 1.3.4.
 
