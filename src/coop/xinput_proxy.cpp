@@ -153,9 +153,10 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
     if (user == 0 && state != nullptr)
     {
         DWORD elapsed = GetTickCount() - g_start;
-        // The scripted menu only needs the first two minutes; after that the real
-        // device is forwarded so the player keeps full keyboard/pad control.
-        if (elapsed >= 130000)
+        // The scripted menu only needs the first two minutes; after the last
+        // panel prompt the real device is forwarded so the player keeps full
+        // keyboard/pad control.
+        if (elapsed >= 118000)
             return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
         WORD buttons = ButtonsAt(elapsed);
         memset(state, 0, sizeof(*state));
@@ -241,8 +242,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_start = GetTickCount();
         char selfPath[MAX_PATH];
         if (GetModuleFileNameA(module, selfPath, MAX_PATH) != 0)
+        {
             g_movesForward = strstr(selfPath, "TestInstances\\1\\") == nullptr;
-            g_isClient = !g_movesForward;
+        }
+        g_isClient = !g_movesForward;
         InitLog(module);
         Log("xinput proxy attached");
         LoadReal();

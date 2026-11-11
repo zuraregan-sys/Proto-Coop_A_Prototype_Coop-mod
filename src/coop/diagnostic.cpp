@@ -74,9 +74,14 @@ static bool g_followLog = false;
 static bool g_debugIntention = false;
 static bool g_logSpawns = false;
 static bool g_dumpHealth = false;
+static bool g_dumpTransform = false;
+static bool g_transformDumped = false;
+static void* g_sendMessage = nullptr;
 static float g_testMass = 0.0f;
 static float g_testHealth = 0.0f;
 static bool g_logEffects = false;
+static volatile long g_creatingRemoteEffect = 0;
+static volatile long g_remoteTransformation = 0;
 static float g_intentTest = 0.0f;
 static bool g_fakeSession = false;
 static bool g_puppetStatic = false;
@@ -85,6 +90,7 @@ static unsigned int g_heartbeat = 0;
 static void Log(const char* format, ...)
 {
     if (g_log == nullptr) return;
+    fprintf(g_log, "t=%lu ", (unsigned long)GetTickCount());
     va_list args;
     va_start(args, format);
     vfprintf(g_log, format, args);
@@ -173,6 +179,7 @@ static void ReadConfig()
     g_debugIntention = GetPrivateProfileIntA("coop", "debug_intention", 0, path) != 0;
     g_logSpawns = GetPrivateProfileIntA("coop", "log_spawns", 0, path) != 0;
     g_dumpHealth = GetPrivateProfileIntA("coop", "dump_health", 0, path) != 0;
+    g_dumpTransform = GetPrivateProfileIntA("coop", "dump_transform", 0, path) != 0;
     g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
     g_testHealth = (float)GetPrivateProfileIntA("coop", "test_health", 0, path);
     g_logEffects = GetPrivateProfileIntA("coop", "log_effects", 0, path) != 0;
@@ -623,7 +630,6 @@ static const char* const g_harmfulBehaviours[] =
     "PoisonReaction",
     "PowerWheel",
     "Tendril",
-    "Transformation",
     "Disguise",
 };
 
@@ -767,6 +773,51 @@ static void DumpHealthBehaviour(void* object)
     {
         const float* values = reinterpret_cast<const float*>(reinterpret_cast<unsigned char*>(behaviour) + offset);
         Log("health: +%03X %.2f %.2f %.2f %.2f", offset, values[0], values[1], values[2], values[3]);
+    }
+}
+
+// The reflected member table of a class: GetMembers() returns a static
+// MemberList (member array, count, base type, base caster). Each member entry is
+// 12 bytes: meta type, offset and name.
+static void DumpReflectedMembers(const char* tag, unsigned int rva)
+{
+    void* list = reinterpret_cast<void* (*)()>(At<void*>(rva))();
+    if (!Plausible(list))
+    {
+        Log("%s: no member list", tag);
+        return;
+    }
+    unsigned int members = ReadU32(list, 0);
+    int count = static_cast<int>(ReadU32(list, 4));
+    Log("%s: list=%p members=%08X count=%d", tag, list, members, count);
+    if (!Plausible(reinterpret_cast<void*>(members)) || count <= 0 || count > 64) return;
+    for (int i = 0; i < count; ++i)
+    {
+        unsigned char* entry = reinterpret_cast<unsigned char*>(members) + i * 12;
+        int offset = *(int*)(entry + 4);
+        unsigned int name = *(unsigned int*)(entry + 8);
+        Log("%s: [%d] offset=0x%X name='%s'", tag, i, offset,
+            Plausible(reinterpret_cast<void*>(name)) ? reinterpret_cast<const char*>(name) : "?");
+    }
+}
+
+// Dumps the first words of the transformation behaviour, so the field that
+// changes with the selected power can be identified.
+static void DumpTransformState(void* player, const char* tag)
+{
+    void* behaviour = FindBehaviourByName(player, "TransformationBehaviour");
+    if (behaviour == nullptr)
+    {
+        Log("transform(%s): no behaviour", tag);
+        return;
+    }
+    Log("transform(%s): behaviour=%p", tag, behaviour);
+    for (unsigned int offset = 0; offset < 0xC0; offset += 0x10)
+    {
+        const unsigned int* words = reinterpret_cast<const unsigned int*>(
+            reinterpret_cast<unsigned char*>(behaviour) + offset);
+        Log("transform(%s): +%02X %08X %08X %08X %08X", tag, offset,
+            words[0], words[1], words[2], words[3]);
     }
 }
 
@@ -924,6 +975,9 @@ static void SpawnPuppet()
     else
     {
         DisableCombatBehaviours(object);
+        Log("transform: puppet behaviour=%p player behaviour=%p",
+            FindBehaviourByName(object, "TransformationBehaviour"),
+            FindBehaviourByName(playerObject, "TransformationBehaviour"));
         ClonePuppetDrivers(reinterpret_cast<void*>(GetAttributeValue(object, 0x10D9653C)),
             reinterpret_cast<void*>(GetAttributeValue(playerObject, 0x10D9653C)));
     }
@@ -1076,18 +1130,32 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
     // Placement from the sender: the transform always, the part name only for
     // effects attached to the character.
     unsigned int target = ReadU32(data + 10, 0x48);
+    ++g_effectRecvCount;
+    if (g_logEffects)
+        Log("effect recv #%u name=%08X target=%08X", g_effectRecvCount, ReadU32(data, 2), target);
+    // Attached effects carry the name of the puppet part they hang on. The name
+    // is a 64-bit hash (portable), but the sender's lookup index is not; resolve
+    // it on the puppet and drop it when the part is unknown (the engine indexes
+    // its matrix table without bounds checks).
+    unsigned int partName[2] = { 0, 0 };
+    int partIndex = -1;
+    if (target != 0xFFFF)
+    {
+        memcpy(partName, data + 10 + 0x40, 8);
+        unsigned int pose = GetAttributeValue(g_puppetObject, 0x10E80688);
+        if (pose != 0)
+            partIndex = reinterpret_cast<int (__thiscall*)(void*, const void*)>(At<void*>(0x006DD6D0))(
+                reinterpret_cast<void*>(pose), partName);
+        if (g_logEffects && g_effectRecvCount <= 120)
+            Log("effect attach part=%08X/%08X index=%d", partName[0], partName[1], partIndex);
+    }
     memcpy(setup, data + 10, 0x40);
-    if (target == 0xFFFF)
-    {
-        memset(setup + 0x40, 0, 8);
-    }
+    if (target != 0xFFFF && partIndex >= 0 && partIndex < 256)
+        memcpy(setup + 0x40, partName, 8);
     else
-    {
-        // Attached effect: no joint name (the sender's index is process-local);
-        // keep it on the puppet's root instead.
         memset(setup + 0x40, 0, 8);
+    if (target != 0xFFFF)
         memcpy(setup + 0x48, &g_puppetHandle, 4);
-    }
     unsigned char out[4] = { 0, 0, 0, 0 };
     unsigned int nameCopy[2];
     memcpy(nameCopy, data + 2, 8);
@@ -1101,6 +1169,7 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
         const void* localName = reinterpret_cast<GetNameFn>(g_archetypeGetName)(archetype);
         if (localName != nullptr) effectName = localName;
     }
+    g_creatingRemoteEffect = 1;
     if (archetype != nullptr)
     {
         if (g_logEffects) Log("effect: create %08X start", ReadU32(data, 2));
@@ -1113,8 +1182,7 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
         reinterpret_cast<void (__thiscall*)(void*, void*, const void*, void*)>(At<void*>(0x0081E6B0))(
             manager, out, effectName, setup);
     }
-    if ((g_effectRecvCount++ % 20) == 0)
-        Log("effect recv #%u archetype=%p drawable=%08X", g_effectRecvCount, archetype, *(const unsigned int*)out);
+    g_creatingRemoteEffect = 0;
 }
 
 static void __cdecl InvalidParameterHandler(const wchar_t* expression, const wchar_t* function,
@@ -1210,6 +1278,9 @@ static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect
     void* result = reinterpret_cast<void* (__thiscall*)(void*, void*, const void*, void*)>(g_startEffect)(
         self, out, name, setup);
     if (!g_transportReady || setup == nullptr || name == nullptr || g_engine == nullptr) return result;
+    // An effect the receiver itself started for a remote one must not be sent
+    // back (it would loop between the two instances).
+    if (g_creatingRemoteEffect) return result;
     unsigned int target = ReadU32(setup, 0x48);
     if (g_logEffects)
         Log("fx: name=%08X target=%08X action=%d pos=%.1f %.1f %.1f", ReadU32(name, 0), target,
@@ -1233,8 +1304,9 @@ static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect
     memcpy(packet + 2, name, 8);
     memcpy(packet + 10, setup, 0xA0);
     sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
-    if ((++g_effectSendCount % 100) == 0)
-        Log("effect send #%u", g_effectSendCount);
+    ++g_effectSendCount;
+    if (g_logEffects)
+        Log("fx send #%u name=%08X target=%08X", g_effectSendCount, ReadU32(name, 0), target);
     return result;
 }
 
@@ -1326,11 +1398,33 @@ static void StartFakeSession()
     g_startSync(&g_fakeOwner, 0x2000, 100);
 }
 
+static void SpawnRemoteTransformation(const unsigned char* data, int length)
+{
+    if (length < 10 || g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
+    unsigned char message[0x28] = { 0 };
+    bool stealthy = length >= 11 && data[10] != 0;
+    // The engine's constructor fills the vftable, the type (0x1E), the id (4)
+    // and the slot name; a hand-built message would miss the vftable.
+    reinterpret_cast<void (__thiscall*)(void*, const void*, bool)>(At<void*>(0x00121620))(
+        message, data + 2, stealthy);
+    g_remoteTransformation = 1;
+    bool result = reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(
+        g_puppetObject, message);
+    g_remoteTransformation = 0;
+    Log("transform recv slot=%08X/%08X '%s' result=%d", ReadU32(data, 2), ReadU32(data, 6),
+        NameText(data + 2), result);
+}
+
 static void HandlePacket(const unsigned char* data, int length)
 {
     if (length >= 10 && data[0] == 'E' && data[1] == '1')
     {
         SpawnRemoteEffect(data, length);
+        return;
+    }
+    if (length >= 10 && data[0] == 'T' && data[1] == '1')
+    {
+        SpawnRemoteTransformation(data, length);
         return;
     }
     if (length >= 4 && data[0] == 'R' && data[1] == '1')
@@ -1431,6 +1525,20 @@ static void FrameTick()
         lastPlayer = localPlayer;
     }
 
+    if (g_dumpTransform && localPlayer != nullptr)
+    {
+        if (!g_transformDumped && FindBehaviourByName(localPlayer, "TransformationBehaviour") != nullptr)
+        {
+            g_transformDumped = true;
+            DumpReflectedMembers("transform", 0x0084380);
+            DumpTransformState(localPlayer, "start");
+        }
+        else if (g_transformDumped && (g_updateCalls % 180) == 0)
+        {
+            DumpTransformState(localPlayer, "tick");
+        }
+    }
+
     // The puppet can die (the city war does not spare it). When its handle no
     // longer resolves, drop it: using the stale pointer aborts the engine.
     if (g_puppetObject != nullptr && g_puppetHandle != 0xFFFF)
@@ -1529,6 +1637,10 @@ static void FrameTick()
     {
         void* localPlayer = g_getPlayerObject(0);
         void* health = localPlayer != nullptr ? FindBehaviourByName(localPlayer, "PrototypeHealthBehaviour") : nullptr;
+        static int healthLog = 0;
+        if ((healthLog++ % 600) == 0)
+            Log("test_health: health=%p max=%.2f", health,
+                health != nullptr ? *(float*)((char*)health + 0x14) : 0.0f);
         if (health != nullptr)
         {
             float maxHealth = *(float*)((char*)health + 0x14);
@@ -1697,6 +1809,33 @@ static void* __attribute__((force_align_arg_pointer)) __cdecl HookApplySync(cons
     return g_applySync(machines, type, message);
 }
 
+static bool __attribute__((force_align_arg_pointer)) __thiscall HookSendMessage(void* self, void* message)
+{
+    if (message != nullptr)
+    {
+        int type = *reinterpret_cast<int*>(reinterpret_cast<unsigned char*>(message) + 4);
+        short id = *reinterpret_cast<short*>(reinterpret_cast<unsigned char*>(message) + 8);
+        if (type == 0x1E && (id == 3 || id == 4 || id == 5 || id == 0x0F))
+        {
+            void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+            if (g_dumpTransform)
+                Log("msg: self=%p player=%p id=%d slot=%08X/%08X", self, player, id,
+                    ReadU32(message, 0x10), ReadU32(message, 0x14));
+            if (id == 4 && self == player && g_transportReady && g_socket != INVALID_SOCKET &&
+                !g_remoteTransformation)
+            {
+                unsigned char packet[11] = { 'T', '1' };
+                memcpy(packet + 2, reinterpret_cast<unsigned char*>(message) + 0x10, 8);
+                packet[10] = *reinterpret_cast<unsigned char*>(reinterpret_cast<unsigned char*>(message) + 0x18) ? 1 : 0;
+                sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+                Log("transform send slot=%08X/%08X '%s'", ReadU32(packet, 2), ReadU32(packet, 6),
+                    NameText(packet + 2));
+            }
+        }
+    }
+    return reinterpret_cast<bool (__thiscall*)(void*, void*)>(g_sendMessage)(self, message);
+}
+
 static bool Install(const char* name, void* target, void* detour, void** original)
 {
     MH_STATUS status = MH_CreateHook(target, detour, original);
@@ -1778,6 +1917,7 @@ static void InstallHooks()
     Install("GameObjectSpawner::Create", At<void*>(0x007F25C0), (void*)&HookCreateSpawned, (void**)&g_createSpawned);
     Install("ControllerSystem::Update", At<void*>(0x00643A20), (void*)&HookControllerUpdate, (void**)&g_controllerUpdate);
     Install("RenderBehaviour::Update", At<void*>(0x008627B0), (void*)&HookRenderUpdate, (void**)&g_renderUpdate);
+    Install("GameObject::SendMessage", At<void*>(0x007E0810), (void*)&HookSendMessage, (void**)&g_sendMessage);
     Install("EffectManager::StartEffect", At<void*>(0x0081E6B0), (void*)&HookStartEffect, (void**)&g_startEffect);
     Install("EffectAction::Slot5", At<void*>(0x008076B0), (void*)&HookActionStart, (void**)&g_actionStart);
     g_drawableArchetypeCaster = reinterpret_cast<void*>(0x10D97DC4);
