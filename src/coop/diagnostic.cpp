@@ -53,6 +53,9 @@ static void* g_controllerUpdate = nullptr;
 static DWORD g_lastTick = 0;
 static unsigned int g_recvCount = 0;
 static void FrameTick();
+static volatile long g_tickCount = 0;
+static volatile long g_phase = 0;
+static DWORD WINAPI WatchdogThread(LPVOID);
 static bool Plausible(const void* pointer);
 static unsigned int ReadU32(const void* base, unsigned int offset);
 static unsigned int GetAttributeValue(void* object, unsigned int vtable);
@@ -1161,6 +1164,24 @@ static void InstallCrtHandler()
     }
 }
 
+static DWORD WINAPI WatchdogThread(LPVOID)
+{
+    long last = -1;
+    long lastStall = -1;
+    while (true)
+    {
+        Sleep(2000);
+        long current = g_tickCount;
+        if (g_transportReady && current == last && current != lastStall)
+        {
+            Log("watchdog: stalled at phase %ld (tick %ld)", g_phase, current);
+            lastStall = current;
+        }
+        last = current;
+    }
+    return 0;
+}
+
 static bool __attribute__((force_align_arg_pointer)) __thiscall HookActionStart(void* self, int arg, float value)
 {
     unsigned int target = ReadU32(self, 0x40);
@@ -1361,6 +1382,8 @@ static void FrameTick()
     DWORD now = GetTickCount();
     if (now == g_lastTick) return;
     g_lastTick = now;
+    g_tickCount++;
+    g_phase = 1;
 
     // The puppet can die (the city war does not spare it). When its handle no
     // longer resolves, drop it: using the stale pointer aborts the engine.
@@ -1388,6 +1411,7 @@ static void FrameTick()
     }
 
     PollSocket();
+    g_phase = 2;
 
     if (!g_started && !g_transportReady && g_updateCalls > 300)
     {
@@ -1411,6 +1435,7 @@ static void FrameTick()
             SendPose();
         if ((g_updateCalls % 3) == 2)
             SendRotation();
+        g_phase = 3;
     }
     if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
     {
@@ -1683,6 +1708,7 @@ static void InstallHooks()
     }
 
     InstallCrashLog();
+    CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
     InstallCrtHandler();
     Install("ChannelManager::Open", At<void*>(0x008C31D0), (void*)&HookOpen, (void**)&g_open);
     Install("ChannelManager::Close", At<void*>(0x008C3670), (void*)&HookClose, (void**)&g_close);
