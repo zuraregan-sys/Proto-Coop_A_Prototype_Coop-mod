@@ -1294,6 +1294,31 @@ static void FrameTick()
     if (now == g_lastTick) return;
     g_lastTick = now;
 
+    // The puppet can die (the city war does not spare it). When its handle no
+    // longer resolves, drop it: using the stale pointer aborts the engine.
+    if (g_puppetObject != nullptr && g_puppetHandle != 0xFFFF)
+    {
+        unsigned int table = ReadU32(g_engine, 0x128348c);
+        bool alive = false;
+        if (Plausible(reinterpret_cast<void*>(table)))
+        {
+            unsigned int entry = table + (g_puppetHandle & 0xFFFF) * 8;
+            unsigned short generation = *(unsigned short*)(entry + 4);
+            alive = *(void**)entry == g_puppetObject && generation == (g_puppetHandle >> 16);
+        }
+        if (!alive)
+        {
+            Log("puppet: lost (handle %08X), will respawn", g_puppetHandle);
+            g_puppetObject = nullptr;
+            g_puppetHandle = 0xFFFF;
+            g_puppetSpawned = false;
+            g_spawnPending = false;
+            g_poseValid = false;
+            g_remoteBasisValid = false;
+            *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = 0xFFFF;
+        }
+    }
+
     PollSocket();
 
     if (!g_started && !g_transportReady && g_updateCalls > 300)
