@@ -1001,8 +1001,8 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
     nameCopy[1] = 0; // the registry index is per process; the hash is the same
     reinterpret_cast<void (__thiscall*)(void*, void*, const void*, void*)>(At<void*>(0x0081E6B0))(
         manager, out, nameCopy, setup);
-    if ((g_effectRecvCount++ % 50) == 0)
-        Log("effect recv #%u", g_effectRecvCount);
+    if ((g_effectRecvCount++ % 20) == 0)
+        Log("effect recv #%u drawable=%08X", g_effectRecvCount, *(const unsigned int*)out);
 }
 
 static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect(void* self, void* out, const void* name, void* setup)
