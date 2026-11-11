@@ -53,6 +53,7 @@ static void* g_controllerUpdate = nullptr;
 static DWORD g_lastTick = 0;
 static unsigned int g_recvCount = 0;
 static void FrameTick();
+static void ReplayRemoteTransformations();
 static volatile long g_tickCount = 0;
 static volatile long g_phase = 0;
 static DWORD WINAPI WatchdogThread(LPVOID);
@@ -978,6 +979,11 @@ static void SpawnPuppet()
         Log("transform: puppet behaviour=%p player behaviour=%p",
             FindBehaviourByName(object, "TransformationBehaviour"),
             FindBehaviourByName(playerObject, "TransformationBehaviour"));
+        void* playerRender = FindBehaviourByName(playerObject, "RenderBehaviour");
+        void* puppetRender = FindBehaviourByName(object, "RenderBehaviour");
+        Log("render: player=%p drawable=%08X puppet=%p drawable=%08X", playerRender,
+            playerRender != nullptr ? ReadU32(playerRender, 0x14) : 0, puppetRender,
+            puppetRender != nullptr ? ReadU32(puppetRender, 0x14) : 0);
         ClonePuppetDrivers(reinterpret_cast<void*>(GetAttributeValue(object, 0x10D9653C)),
             reinterpret_cast<void*>(GetAttributeValue(playerObject, 0x10D9653C)));
     }
@@ -985,6 +991,7 @@ static void SpawnPuppet()
     Log("spawn: index=%u gen=%u handle=%08X p1=%p at %.1f %.1f %.1f", objectIndex, generation, handle,
         player1, position[0], position[1], position[2]);
     g_puppetSpawned = true;
+    ReplayRemoteTransformations();
 }
 
 
@@ -1398,21 +1405,103 @@ static void StartFakeSession()
     g_startSync(&g_fakeOwner, 0x2000, 100);
 }
 
+// The last transformation state received for each slot, so a respawned or
+// reloaded puppet can be put back into the same form without waiting for the
+// peer to change power again.
+struct RemoteTransformationState
+{
+    unsigned int slot[2];
+    unsigned int description[2];
+    bool hasDescription;
+    bool hasStart;
+    bool stealthy;
+};
+static RemoteTransformationState g_remoteTransforms[8];
+static int g_remoteTransformCount = 0;
+
+static RemoteTransformationState* FindRemoteTransform(const unsigned int* slot, bool create)
+{
+    for (int i = 0; i < g_remoteTransformCount; ++i)
+        if (g_remoteTransforms[i].slot[0] == slot[0] && g_remoteTransforms[i].slot[1] == slot[1])
+            return &g_remoteTransforms[i];
+    if (!create || g_remoteTransformCount >= 8) return nullptr;
+    RemoteTransformationState* entry = &g_remoteTransforms[g_remoteTransformCount++];
+    memset(entry, 0, sizeof(*entry));
+    entry->slot[0] = slot[0];
+    entry->slot[1] = slot[1];
+    return entry;
+}
+
+static bool SendTransformDesired(void* object, const unsigned int* slot, const unsigned int* description, bool unknown)
+{
+    unsigned char message[0x28] = { 0 };
+    // SetDesiredTransformationMessage(slot, description, unknown): its
+    // constructor fills the vftable, type 0x1E and id 3.
+    reinterpret_cast<void (__thiscall*)(void*, const void*, const void*, bool)>(At<void*>(0x001215B0))(
+        message, slot, description, unknown);
+    return reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(object, message);
+}
+
+static bool SendTransformStart(void* object, const unsigned int* slot, bool stealthy)
+{
+    unsigned char message[0x28] = { 0 };
+    // StartTransformationMessage(slot, stealthy): type 0x1E, id 4.
+    reinterpret_cast<void (__thiscall*)(void*, const void*, bool)>(At<void*>(0x00121620))(message, slot, stealthy);
+    return reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(object, message);
+}
+
 static void SpawnRemoteTransformation(const unsigned char* data, int length)
 {
-    if (length < 10 || g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
-    unsigned char message[0x28] = { 0 };
+    if (length < 10) return;
+    unsigned int slot[2];
+    memcpy(slot, data + 2, 8);
     bool stealthy = length >= 11 && data[10] != 0;
-    // The engine's constructor fills the vftable, the type (0x1E), the id (4)
-    // and the slot name; a hand-built message would miss the vftable.
-    reinterpret_cast<void (__thiscall*)(void*, const void*, bool)>(At<void*>(0x00121620))(
-        message, data + 2, stealthy);
+    RemoteTransformationState* entry = FindRemoteTransform(slot, true);
+    if (entry != nullptr)
+    {
+        entry->stealthy = stealthy;
+        entry->hasStart = true;
+    }
+    if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
     g_remoteTransformation = 1;
-    bool result = reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(
-        g_puppetObject, message);
+    bool result = SendTransformStart(g_puppetObject, slot, stealthy);
     g_remoteTransformation = 0;
-    Log("transform recv slot=%08X/%08X '%s' result=%d", ReadU32(data, 2), ReadU32(data, 6),
-        NameText(data + 2), result);
+    Log("transform recv slot=%08X/%08X '%s' result=%d", slot[0], slot[1], NameText(slot), result);
+}
+
+static void SpawnRemoteDesiredTransformation(const unsigned char* data, int length)
+{
+    if (length < 18) return;
+    unsigned int slot[2], description[2];
+    memcpy(slot, data + 2, 8);
+    memcpy(description, data + 10, 8);
+    bool unknown = length >= 19 && data[18] != 0;
+    RemoteTransformationState* entry = FindRemoteTransform(slot, true);
+    if (entry != nullptr)
+    {
+        memcpy(entry->description, description, 8);
+        entry->hasDescription = true;
+    }
+    if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
+    g_remoteTransformation = 1;
+    bool result = SendTransformDesired(g_puppetObject, slot, description, unknown);
+    g_remoteTransformation = 0;
+    Log("transform desired slot=%08X/%08X desc=%08X/%08X result=%d", slot[0], slot[1],
+        description[0], description[1], result);
+}
+
+static void ReplayRemoteTransformations()
+{
+    if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF || g_remoteTransformCount == 0) return;
+    g_remoteTransformation = 1;
+    for (int i = 0; i < g_remoteTransformCount; ++i)
+        if (g_remoteTransforms[i].hasDescription)
+            SendTransformDesired(g_puppetObject, g_remoteTransforms[i].slot, g_remoteTransforms[i].description, false);
+    for (int i = 0; i < g_remoteTransformCount; ++i)
+        if (g_remoteTransforms[i].hasStart)
+            SendTransformStart(g_puppetObject, g_remoteTransforms[i].slot, g_remoteTransforms[i].stealthy);
+    g_remoteTransformation = 0;
+    Log("transform replay: %d slots", g_remoteTransformCount);
 }
 
 static void HandlePacket(const unsigned char* data, int length)
@@ -1425,6 +1514,11 @@ static void HandlePacket(const unsigned char* data, int length)
     if (length >= 10 && data[0] == 'T' && data[1] == '1')
     {
         SpawnRemoteTransformation(data, length);
+        return;
+    }
+    if (length >= 18 && data[0] == 'D' && data[1] == '1')
+    {
+        SpawnRemoteDesiredTransformation(data, length);
         return;
     }
     if (length >= 4 && data[0] == 'R' && data[1] == '1')
@@ -1821,8 +1915,19 @@ static bool __attribute__((force_align_arg_pointer)) __thiscall HookSendMessage(
             if (g_dumpTransform)
                 Log("msg: self=%p player=%p id=%d slot=%08X/%08X", self, player, id,
                     ReadU32(message, 0x10), ReadU32(message, 0x14));
-            if (id == 4 && self == player && g_transportReady && g_socket != INVALID_SOCKET &&
-                !g_remoteTransformation)
+            bool fromPlayer = self == player && g_transportReady && g_socket != INVALID_SOCKET &&
+                !g_remoteTransformation;
+            if (id == 3 && fromPlayer)
+            {
+                unsigned char packet[19] = { 'D', '1' };
+                memcpy(packet + 2, reinterpret_cast<unsigned char*>(message) + 0x10, 8);
+                memcpy(packet + 10, reinterpret_cast<unsigned char*>(message) + 0x18, 8);
+                packet[18] = *reinterpret_cast<unsigned char*>(reinterpret_cast<unsigned char*>(message) + 0x20) ? 1 : 0;
+                sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+                Log("transform desired send slot=%08X/%08X desc=%08X/%08X", ReadU32(packet, 2), ReadU32(packet, 6),
+                    ReadU32(packet, 10), ReadU32(packet, 14));
+            }
+            if (id == 4 && fromPlayer)
             {
                 unsigned char packet[11] = { 'T', '1' };
                 memcpy(packet + 2, reinterpret_cast<unsigned char*>(message) + 0x10, 8);
