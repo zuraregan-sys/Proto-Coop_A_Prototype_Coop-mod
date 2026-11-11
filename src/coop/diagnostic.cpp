@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <math.h>
 #include "MinHook.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -255,8 +256,10 @@ static void SetObjectPosition(void* object, float x, float y, float z)
 }
 
 static unsigned char g_poseBuffer[128 * 32];
+static unsigned char g_poseDisplay[128 * 32];
 static unsigned short g_poseJoints = 0;
 static bool g_poseValid = false;
+static bool g_poseDisplayReady = false;
 static unsigned int g_poseApplied = 0;
 static bool g_poseSendLogged = false;
 static bool g_poseEnterLogged = false;
@@ -301,7 +304,12 @@ static void StorePose(const unsigned char* data, int length)
     if (joints == 0 || joints > 128 || length < 4 + (int)joints * 32) return;
     memcpy(g_poseBuffer, data + 4, (size_t)joints * 32);
     g_poseJoints = joints;
-    if (!g_poseValid) Log("pose stored: %u joints", joints);
+    if (!g_poseValid)
+    {
+        memcpy(g_poseDisplay, g_poseBuffer, (size_t)joints * 32);
+        g_poseDisplayReady = true;
+        Log("pose stored: %u joints", joints);
+    }
     g_poseValid = true;
 }
 
@@ -880,10 +888,32 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookRenderUpdate
     unsigned int translations = ReadU32(reinterpret_cast<void*>(pose), 0x1C);
     if (!Plausible(reinterpret_cast<void*>(rotations)) || !Plausible(reinterpret_cast<void*>(translations)))
         return;
+    // Smooth the 30 Hz stream up to the frame rate: nlerp the quaternions and
+    // lerp the translations of a display copy, then push that to the pose.
     for (unsigned int i = 0; i < g_poseJoints; ++i)
     {
-        memcpy(reinterpret_cast<void*>(rotations + i * 16), g_poseBuffer + i * 32, 16);
-        memcpy(reinterpret_cast<void*>(translations + i * 16), g_poseBuffer + i * 32 + 16, 16);
+        float* shown = reinterpret_cast<float*>(g_poseDisplay + i * 32);
+        const float* target = reinterpret_cast<const float*>(g_poseBuffer + i * 32);
+        float dot = shown[0] * target[0] + shown[1] * target[1] + shown[2] * target[2] + shown[3] * target[3];
+        float sign = dot < 0.0f ? -1.0f : 1.0f;
+        for (int k = 0; k < 4; ++k)
+            shown[k] += (target[k] * sign - shown[k]) * 0.45f;
+        float length = sqrtf(shown[0] * shown[0] + shown[1] * shown[1] + shown[2] * shown[2] + shown[3] * shown[3]);
+        if (length > 0.0001f)
+        {
+            shown[0] /= length;
+            shown[1] /= length;
+            shown[2] /= length;
+            shown[3] /= length;
+        }
+        for (int k = 4; k < 7; ++k)
+            shown[k] += (target[k] - shown[k]) * 0.45f;
+        shown[7] = target[7];
+    }
+    for (unsigned int i = 0; i < g_poseJoints; ++i)
+    {
+        memcpy(reinterpret_cast<void*>(rotations + i * 16), g_poseDisplay + i * 32, 16);
+        memcpy(reinterpret_cast<void*>(translations + i * 16), g_poseDisplay + i * 32 + 16, 16);
     }
     *(unsigned char*)(pose + 0x40) |= 3;
     reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006DD6E0))(reinterpret_cast<void*>(pose));
@@ -1060,7 +1090,8 @@ static void FrameTick()
         // ~20 Hz keeps the remote avatar close to its real position.
         if ((g_updateCalls % 3) == 0)
             SendPlayerTransform();
-        if ((g_updateCalls % 3) == 1)
+        // 30 Hz pose stream; the receiver smooths it to the frame rate.
+        if ((g_updateCalls % 2) == 0)
             SendPose();
     }
     if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
