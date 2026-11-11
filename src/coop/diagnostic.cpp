@@ -55,6 +55,10 @@ static int g_testMove = 0;
 static bool g_testMoved = false;
 static float g_testOffsetY = 0.0f;
 static int g_puppetLocal = 0;
+static int g_testWalk = 0;
+static int g_testWalkLeft = 0;
+static int g_puppetLog = 0;
+static bool g_followLog = false;
 static bool g_puppetStatic = false;
 static unsigned int g_heartbeat = 0;
 
@@ -141,6 +145,8 @@ static void ReadConfig()
     g_testMove = GetPrivateProfileIntA("coop", "test_move", 0, path);
     g_testOffsetY = (float)GetPrivateProfileIntA("coop", "test_offset_y", 0, path);
     g_puppetLocal = GetPrivateProfileIntA("coop", "puppet_local", 0, path);
+    g_testWalk = GetPrivateProfileIntA("coop", "test_walk", 0, path);
+    g_followLog = GetPrivateProfileIntA("coop", "follow_log", 0, path) != 0;
     g_puppetStatic = GetPrivateProfileIntA("coop", "puppet_static", 0, path) != 0;
     Log("config role=%s local=%u peer=%u mask=%d offset_y=%.0f", g_isHost ? "host" : "client", g_localPort,
         g_peerPort, g_peerMask, g_testOffsetY);
@@ -867,6 +873,26 @@ static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
     }
     if (g_spawnPending && !g_puppetSpawned)
         SpawnPuppet();
+    if (g_isHost && g_testWalk > 0 && g_testWalkLeft == 0 && g_updateCalls > 6000)
+    {
+        g_testWalkLeft = g_testWalk;
+        Log("walk: starting %d frames", g_testWalk);
+    }
+    if (g_testWalkLeft > 0)
+    {
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+        if (player != nullptr && ReadObjectPosition(player, &x, &y, &z))
+        {
+            SetObjectPosition(player, x + 0.2f, y, z);
+            if (--g_testWalkLeft == 0)
+                Log("walk: finished at %.2f %.2f %.2f", x + 0.2f, y, z);
+        }
+        else
+        {
+            g_testWalkLeft = 0;
+        }
+    }
     if (g_puppetObject != nullptr)
     {
         float px = 0.0f, py = 0.0f, pz = 0.0f;
@@ -925,6 +951,8 @@ static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
                 g_puppetZ += dz * 0.25f;
             }
         }
+        if (g_followLog && (g_updateCalls % 15) == 0)
+            Log("follow: puppet %.2f %.2f %.2f target %.2f %.2f %.2f", g_puppetX, g_puppetY, g_puppetZ, x, y, z);
         SetObjectPosition(g_puppetObject, g_puppetX, g_puppetY, g_puppetZ);
     }
 }
