@@ -1102,6 +1102,23 @@ static void __cdecl InvalidParameterHandler(const wchar_t* expression, const wch
 // The engine aborts the process when a replicated effect makes it resolve
 // something that does not exist locally (an unknown joint, for example). A
 // handler of our own turns that abort into a logged no-op.
+static LONG WINAPI UnhandledExceptionFilterLog(EXCEPTION_POINTERS* info)
+{
+    if (info != nullptr && info->ExceptionRecord != nullptr)
+    {
+        Log("unhandled: code=%08X address=%p flags=%08X",
+            info->ExceptionRecord->ExceptionCode,
+            info->ExceptionRecord->ExceptionAddress,
+            info->ExceptionRecord->ExceptionFlags);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InstallCrashLog()
+{
+    SetUnhandledExceptionFilter(UnhandledExceptionFilterLog);
+}
+
 static void InstallCrtHandler()
 {
     HMODULE crt = GetModuleHandleA("MSVCR80.dll");
@@ -1638,6 +1655,7 @@ static void InstallHooks()
         return;
     }
 
+    InstallCrashLog();
     InstallCrtHandler();
     Install("ChannelManager::Open", At<void*>(0x008C31D0), (void*)&HookOpen, (void**)&g_open);
     Install("ChannelManager::Close", At<void*>(0x008C3670), (void*)&HookClose, (void**)&g_close);
