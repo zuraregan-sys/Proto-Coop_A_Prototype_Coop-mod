@@ -79,10 +79,6 @@ static bool g_dumpTransform = false;
 static bool g_transformDumped = false;
 static void* g_sendMessage = nullptr;
 static void* g_copyTemplate = nullptr;
-static unsigned int g_puppetHideUntil = 0;
-static bool g_puppetRenderEnabled = true;
-static bool g_puppetTransformEnabled = true;
-static bool g_localTransformActive = false;
 static float g_testMass = 0.0f;
 static float g_testHealth = 0.0f;
 static bool g_logEffects = false;
@@ -715,28 +711,6 @@ static void* FindBehaviourByName(void* object, const char* wanted)
     return nullptr;
 }
 
-static void SetPuppetRenderEnabled(bool enabled)
-{
-    if (g_puppetRenderEnabled == enabled) return;
-    if (g_puppetObject == nullptr) return;
-    void* render = FindBehaviourByName(g_puppetObject, "RenderBehaviour");
-    if (render == nullptr) return;
-    reinterpret_cast<void (__thiscall*)(void*, bool)>(At<void*>(0x007EEB50))(render, enabled);
-    g_puppetRenderEnabled = enabled;
-    Log("render: puppet %s", enabled ? "on" : "off");
-}
-
-static void SetPuppetTransformationEnabled(bool enabled)
-{
-    if (g_puppetTransformEnabled == enabled) return;
-    if (g_puppetObject == nullptr) return;
-    void* transform = FindBehaviourByName(g_puppetObject, "TransformationBehaviour");
-    if (transform == nullptr) return;
-    reinterpret_cast<void (__thiscall*)(void*, bool)>(At<void*>(0x007EEB50))(transform, enabled);
-    g_puppetTransformEnabled = enabled;
-    Log("transform: puppet behaviour %s", enabled ? "on" : "off");
-}
-
 // Dumps the character's intention state (behaviour+0x10, 0x58 bytes) so the
 // movement axes can be told apart from the rest of the fields.
 static void DumpIntention(void* object, const char* tag)
@@ -1082,7 +1056,6 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookRenderUpdate
 {
     reinterpret_cast<void (__thiscall*)(void*, float, unsigned short)>(g_renderUpdate)(self, dt, mask);
     if (g_puppetObject == nullptr || !g_poseValid) return;
-    if (g_puppetHideUntil != 0 && GetTickCount() < g_puppetHideUntil) return;
     void* owner = *(void**)(reinterpret_cast<unsigned char*>(self) + 4);
     if (owner == nullptr) owner = *(void**)(reinterpret_cast<unsigned char*>(self) + 0);
     if (owner != g_puppetObject) return;
@@ -1866,30 +1839,6 @@ static void FrameTick()
         {
             DumpTransformState(localPlayer, "tick");
         }
-    }
-
-    // While the local power wheel is open (and briefly after), or right after
-    // the local player starts a transformation, the puppet's shared template
-    // can collide with the player's and crash. Hide/disable it until the
-    // selection has settled.
-    if (localPlayer != nullptr)
-    {
-        unsigned int now = GetTickCount();
-        TransformSlotState local[8];
-        int localCount = ReadTransformSlots(localPlayer, local, 8);
-        bool active = false;
-        for (int i = 0; i < localCount; ++i)
-            if (local[i].active) active = true;
-        if (active && !g_localTransformActive)
-            g_puppetHideUntil = now + 3000;
-        g_localTransformActive = active;
-        if (IsPowerWheelOpen(localPlayer))
-            g_puppetHideUntil = now + 3000;
-        bool hidden = g_puppetHideUntil != 0 && now < g_puppetHideUntil;
-        if (g_puppetObject != nullptr && hidden == g_puppetRenderEnabled)
-            SetPuppetRenderEnabled(!hidden);
-        if (g_puppetObject != nullptr && hidden == g_puppetTransformEnabled)
-            SetPuppetTransformationEnabled(!hidden);
     }
 
     // The puppet can die (the city war does not spare it). When its handle no
