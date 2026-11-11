@@ -1032,7 +1032,16 @@ static void* FindDrawableArchetype(unsigned int hash)
                 if (!seen && inventoryCount < 160) inventories[inventoryCount++] = object;
                 continue;
             }
-            void* archetype = cast(&caster, object);
+            void* archetype = nullptr;
+            unsigned int vtable = ReadU32(object, 0);
+            // Only C++ objects with valid RTTI: dynamic_cast throws
+            // std::__non_rtti_object (and terminates) on anything else.
+            if (vtable >= 0x10D00000 && vtable <= 0x11200000 &&
+                Plausible(reinterpret_cast<void*>(vtable - 4)) &&
+                Plausible(reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(vtable - 4), 0))))
+            {
+                archetype = cast(&caster, object);
+            }
             if (archetype == nullptr) continue;
             const void* name = getName(archetype);
             if (name == nullptr || ReadU32(const_cast<void*>(name), 0) != hash) continue;
@@ -1106,10 +1115,28 @@ static LONG WINAPI UnhandledExceptionFilterLog(EXCEPTION_POINTERS* info)
 {
     if (info != nullptr && info->ExceptionRecord != nullptr)
     {
-        Log("unhandled: code=%08X address=%p flags=%08X",
-            info->ExceptionRecord->ExceptionCode,
-            info->ExceptionRecord->ExceptionAddress,
-            info->ExceptionRecord->ExceptionFlags);
+        EXCEPTION_RECORD* record = info->ExceptionRecord;
+        Log("unhandled: code=%08X address=%p flags=%08X", record->ExceptionCode,
+            record->ExceptionAddress, record->ExceptionFlags);
+        if (record->ExceptionCode == 0xE06D7363 && record->NumberParameters >= 3)
+        {
+            // MSVC C++ exception: [0] magic, [1] thrown object, [2] ThrowInfo.
+            unsigned int throwInfo = (unsigned int)record->ExceptionInformation[2];
+            if (Plausible(reinterpret_cast<void*>(throwInfo)))
+            {
+                unsigned int array = ReadU32(reinterpret_cast<void*>(throwInfo), 0x0C);
+                if (Plausible(reinterpret_cast<void*>(array)))
+                {
+                    unsigned int catchable = ReadU32(reinterpret_cast<void*>(array), 4);
+                    if (Plausible(reinterpret_cast<void*>(catchable)))
+                    {
+                        unsigned int descriptor = ReadU32(reinterpret_cast<void*>(catchable), 4);
+                        if (Plausible(reinterpret_cast<void*>(descriptor)))
+                            Log("unhandled: c++ type=%s", reinterpret_cast<const char*>(descriptor + 8));
+                    }
+                }
+            }
+        }
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
