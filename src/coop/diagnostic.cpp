@@ -117,6 +117,8 @@ static bool g_spawnPending = false;
 static bool g_puppetSpawned = false;
 static bool g_attrDumped = false;
 static void* g_puppetObject = nullptr;static bool g_remoteValid = false;
+static float g_puppetX = 0.0f, g_puppetY = 0.0f, g_puppetZ = 0.0f;
+static bool g_puppetPlaced = false;
 static float g_remoteX = 0.0f, g_remoteY = 0.0f, g_remoteZ = 0.0f;
 
 static void __attribute__((force_align_arg_pointer)) __thiscall HookSend(void* self, int target, int type, const void* data, unsigned int length, int flag);
@@ -208,13 +210,23 @@ static void* ReadObjectMatrix(void* object)
     return reinterpret_cast<GetMatrixFn>(vtable[1])(transformAttribute);
 }
 
+// The matrix lives inline after the attribute's vtable; reading it here keeps
+// the update path free of one virtual call per frame.
+static const float* ReadInlineMatrix(void* object)
+{
+    if (object == nullptr) return nullptr;
+    void* transformAttribute = *(void**)(reinterpret_cast<unsigned char*>(object) + 0x1c);
+    if (transformAttribute == nullptr) return nullptr;
+    return reinterpret_cast<const float*>(reinterpret_cast<unsigned char*>(transformAttribute) + 4);
+}
+
 static bool ReadObjectPosition(void* player, float* x, float* y, float* z)
 {
-    void* matrix = ReadObjectMatrix(player);
+    const float* matrix = ReadInlineMatrix(player);
     if (matrix == nullptr) return false;
-    *x = *(float*)(reinterpret_cast<unsigned char*>(matrix) + 0x30);
-    *y = *(float*)(reinterpret_cast<unsigned char*>(matrix) + 0x34);
-    *z = *(float*)(reinterpret_cast<unsigned char*>(matrix) + 0x38);
+    *x = matrix[12];
+    *y = matrix[13];
+    *z = matrix[14];
     return true;
 }
 
@@ -286,6 +298,10 @@ static void DumpAttributes(void* object)
                 NameText(reinterpret_cast<unsigned char*>(attribute) + 0xC));
     }
     unsigned int dynamicList = *(unsigned int*)(bytes + 0x18);
+    void* viaVtable = ReadObjectMatrix(object);
+    const float* inlineMatrix = ReadInlineMatrix(object);
+    Log("matrix: vtable=%p inline=%p same=%d", viaVtable, reinterpret_cast<const void*>(inlineMatrix),
+        viaVtable == reinterpret_cast<const void*>(inlineMatrix));
     if (dynamicList == 0)
     {
         Log("attrs: no dynamic list");
@@ -663,10 +679,13 @@ static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
 {
     if (!g_started && g_updateCalls > 300)
         StartFakeSession();
-    if (g_started && (g_updateCalls % 60) == 0)
+    if (g_started)
     {
-        SendHeartbeat();
-        SendPlayerTransform();
+        if ((g_updateCalls % 60) == 0)
+            SendHeartbeat();
+        // ~10 Hz so the remote avatar can be interpolated smoothly.
+        if ((g_updateCalls % 6) == 0)
+            SendPlayerTransform();
     }
     if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
     {
@@ -747,7 +766,33 @@ static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
                 y = py;
             }
         }
-        SetObjectPosition(g_puppetObject, x, y, z);
+        // Smooth the steps between packets; snap when the gap is too large.
+        if (!g_puppetPlaced)
+        {
+            g_puppetX = x;
+            g_puppetY = y;
+            g_puppetZ = z;
+            g_puppetPlaced = true;
+        }
+        else
+        {
+            float dx = x - g_puppetX;
+            float dy = y - g_puppetY;
+            float dz = z - g_puppetZ;
+            if (dx * dx + dy * dy + dz * dz > 64.0f)
+            {
+                g_puppetX = x;
+                g_puppetY = y;
+                g_puppetZ = z;
+            }
+            else
+            {
+                g_puppetX += dx * 0.25f;
+                g_puppetY += dy * 0.25f;
+                g_puppetZ += dz * 0.25f;
+            }
+        }
+        SetObjectPosition(g_puppetObject, g_puppetX, g_puppetY, g_puppetZ);
     }
 }
 

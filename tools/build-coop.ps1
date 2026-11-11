@@ -32,7 +32,9 @@ foreach ($source in $MinHookSources) {
 }
 
 $DiagObj = Join-Path $Build "diagnostic.o"
-& $ClangPP @Common @Includes -c "$Src\diagnostic.cpp" -o $DiagObj
+# No SSE for the plugin: the engine calls the hooks with a stack that is not
+# 16-byte aligned, and clang's aligned SSE spills fault (movaps) inside them.
+& $ClangPP @Common @Includes -mno-sse -mno-sse2 -mfpmath=387 -c "$Src\diagnostic.cpp" -o $DiagObj
 if ($LASTEXITCODE -ne 0) { throw "compile failed: diagnostic.cpp" }
 
 $Out = Join-Path $Build "prototype_coop.asi"
