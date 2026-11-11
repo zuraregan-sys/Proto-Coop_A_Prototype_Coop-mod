@@ -1480,11 +1480,18 @@ static bool SendTransformStart(void* object, const unsigned int* slot, bool stea
     return reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(object, message);
 }
 
+static bool IsPowerWheelOpen(void* player)
+{
+    void* behaviour = FindBehaviourByName(player, "PowerWheelBehaviour");
+    if (behaviour == nullptr) return false;
+    return *(unsigned char*)(reinterpret_cast<unsigned char*>(behaviour) + 0xC) != 0;
+}
+
 static void SendTransformState()
 {
     if (!g_transportReady || g_socket == INVALID_SOCKET) return;
     void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
-    if (player == nullptr) return;
+    if (player == nullptr || IsPowerWheelOpen(player)) return;
     TransformSlotState state[8];
     int count = ReadTransformSlots(player, state, 8);
     if (count <= 0) return;
@@ -1549,6 +1556,8 @@ static bool AppliedStateChanged(const TransformSlotState& state)
 static void ApplyTransformState(const TransformSlotState* state, int count, bool force)
 {
     if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
+    void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if (localPlayer != nullptr && IsPowerWheelOpen(localPlayer)) return;
     void* behaviour = FindBehaviourByName(g_puppetObject, "TransformationBehaviour");
     if (behaviour == nullptr) return;
     g_remoteTransformation = 1;
