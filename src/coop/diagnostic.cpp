@@ -78,6 +78,8 @@ static bool g_dumpHealth = false;
 static bool g_dumpTransform = false;
 static bool g_transformDumped = false;
 static void* g_sendMessage = nullptr;
+static unsigned int g_puppetHideUntil = 0;
+static bool g_puppetRenderEnabled = true;
 static float g_testMass = 0.0f;
 static float g_testHealth = 0.0f;
 static bool g_logEffects = false;
@@ -710,6 +712,17 @@ static void* FindBehaviourByName(void* object, const char* wanted)
     return nullptr;
 }
 
+static void SetPuppetRenderEnabled(bool enabled)
+{
+    if (g_puppetRenderEnabled == enabled) return;
+    if (g_puppetObject == nullptr) return;
+    void* render = FindBehaviourByName(g_puppetObject, "RenderBehaviour");
+    if (render == nullptr) return;
+    reinterpret_cast<void (__thiscall*)(void*, bool)>(At<void*>(0x007EEB50))(render, enabled);
+    g_puppetRenderEnabled = enabled;
+    Log("render: puppet %s", enabled ? "on" : "off");
+}
+
 // Dumps the character's intention state (behaviour+0x10, 0x58 bytes) so the
 // movement axes can be told apart from the rest of the fields.
 static void DumpIntention(void* object, const char* tag)
@@ -1055,6 +1068,7 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookRenderUpdate
 {
     reinterpret_cast<void (__thiscall*)(void*, float, unsigned short)>(g_renderUpdate)(self, dt, mask);
     if (g_puppetObject == nullptr || !g_poseValid) return;
+    if (g_puppetHideUntil != 0 && GetTickCount() < g_puppetHideUntil) return;
     void* owner = *(void**)(reinterpret_cast<unsigned char*>(self) + 4);
     if (owner == nullptr) owner = *(void**)(reinterpret_cast<unsigned char*>(self) + 0);
     if (owner != g_puppetObject) return;
@@ -1655,13 +1669,17 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
                     state[i].slot[1]);
             continue;
         }
-        // Body transformations (armor, muscle mass) add a second body template
-        // on the puppet, which already has its normal body: four arms. Only
-        // arm-level transformations (no bodyTemplate) are safe to start.
-        if (ReadU32(reinterpret_cast<void*>(description), 0x20) != 0)
+        // Body (`bodyTemplate`) and left-arm (`overrideLeftArmTemplate`)
+        // transformations add a second set of parts to the cloned puppet,
+        // which already has its normal body: four arms / two pairs of hands.
+        // Only right-arm transformations (both zero, e.g. blade/claw) are safe
+        // until the normal parts can be hidden.
+        unsigned int bodyTemplate = ReadU32(reinterpret_cast<void*>(description), 0x20);
+        unsigned int leftTemplate = ReadU32(reinterpret_cast<void*>(description), 0x30);
+        if (bodyTemplate != 0 || leftTemplate != 0)
         {
             if (g_dumpTransform)
-                Log("transform state: skip body transformation slot=%08X/%08X", state[i].slot[0],
+                Log("transform state: skip body/left transformation slot=%08X/%08X", state[i].slot[0],
                     state[i].slot[1]);
             continue;
         }
@@ -1834,6 +1852,19 @@ static void FrameTick()
         {
             DumpTransformState(localPlayer, "tick");
         }
+    }
+
+    // While the local power wheel is open (and briefly after), the puppet's
+    // transformation/pose render can collide with the player's and crash.
+    // Hide it until the selection has settled.
+    if (localPlayer != nullptr)
+    {
+        unsigned int now = GetTickCount();
+        if (IsPowerWheelOpen(localPlayer))
+            g_puppetHideUntil = now + 3000;
+        bool hidden = g_puppetHideUntil != 0 && now < g_puppetHideUntil;
+        if (g_puppetObject != nullptr && hidden == g_puppetRenderEnabled)
+            SetPuppetRenderEnabled(!hidden);
     }
 
     // The puppet can die (the city war does not spare it). When its handle no
