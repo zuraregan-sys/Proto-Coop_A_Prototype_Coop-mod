@@ -52,6 +52,9 @@ static void* g_controllerUpdate = nullptr;
 static DWORD g_lastTick = 0;
 static unsigned int g_recvCount = 0;
 static void FrameTick();
+static bool Plausible(const void* pointer);
+static unsigned int ReadU32(const void* base, unsigned int offset);
+static unsigned int GetAttributeValue(void* object, unsigned int vtable);
 static sockaddr_in g_peer;
 static unsigned short g_localPort = 27016;
 static unsigned short g_peerPort = 27017;
@@ -249,6 +252,57 @@ static void SetObjectPosition(void* object, float x, float y, float z)
     if (object == nullptr || g_setPosition == nullptr) return;
     float position[3] = { x, y, z };
     reinterpret_cast<void (__thiscall*)(void*, const float*)>(g_setPosition)(object, position);
+}
+
+static unsigned char g_poseBuffer[128 * 32];
+static unsigned short g_poseJoints = 0;
+static bool g_poseValid = false;
+static unsigned int g_poseApplied = 0;
+static bool g_poseSendLogged = false;
+static bool g_poseEnterLogged = false;
+
+// Streams the local player's joint transforms (quaternion + translation per
+// joint) so the remote avatar can be drawn with its owner's animation.
+static void SendPose()
+{
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if (!g_poseEnterLogged) { g_poseEnterLogged = true; Log("pose enter: player=%p socket=%d", player, (int)g_socket); }
+    if (player == nullptr || g_socket == INVALID_SOCKET) return;
+    unsigned int pose = GetAttributeValue(player, 0x10E80688);
+    if (!Plausible(reinterpret_cast<void*>(pose))) return;
+    unsigned int joints = ReadU32(reinterpret_cast<void*>(pose), 0x14);
+    unsigned int rotations = ReadU32(reinterpret_cast<void*>(pose), 0x18);
+    unsigned int translations = ReadU32(reinterpret_cast<void*>(pose), 0x1C);
+    if (!g_poseSendLogged)
+    {
+        g_poseSendLogged = true;
+        Log("pose send: pose=%08X joints=%u rot=%08X trans=%08X", pose, joints, rotations, translations);
+    }
+    if (joints == 0 || joints > 128 || !Plausible(reinterpret_cast<void*>(rotations)) ||
+        !Plausible(reinterpret_cast<void*>(translations)))
+        return;
+    static unsigned char packet[8 + 128 * 32];
+    packet[0] = 'A';
+    packet[1] = '1';
+    memcpy(packet + 2, &joints, 2);
+    for (unsigned int i = 0; i < joints; ++i)
+    {
+        memcpy(packet + 4 + i * 32, reinterpret_cast<void*>(rotations + i * 16), 16);
+        memcpy(packet + 4 + i * 32 + 16, reinterpret_cast<void*>(translations + i * 16), 16);
+    }
+    sendto(g_socket, (const char*)packet, 4 + (int)joints * 32, 0, (sockaddr*)&g_peer, sizeof(g_peer));
+}
+
+static void StorePose(const unsigned char* data, int length)
+{
+    if (length < 4) return;
+    unsigned short joints = 0;
+    memcpy(&joints, data + 2, 2);
+    if (joints == 0 || joints > 128 || length < 4 + (int)joints * 32) return;
+    memcpy(g_poseBuffer, data + 4, (size_t)joints * 32);
+    g_poseJoints = joints;
+    if (!g_poseValid) Log("pose stored: %u joints", joints);
+    g_poseValid = true;
 }
 
 static void SendPlayerTransform()
@@ -810,6 +864,36 @@ static void SpawnPuppet()
 }
 
 
+static void* g_renderUpdate = nullptr;
+
+static void __attribute__((force_align_arg_pointer)) __thiscall HookRenderUpdate(void* self, float dt, unsigned short mask)
+{
+    reinterpret_cast<void (__thiscall*)(void*, float, unsigned short)>(g_renderUpdate)(self, dt, mask);
+    if (g_puppetObject == nullptr || !g_poseValid) return;
+    void* owner = *(void**)(reinterpret_cast<unsigned char*>(self) + 4);
+    if (owner == nullptr) owner = *(void**)(reinterpret_cast<unsigned char*>(self) + 0);
+    if (owner != g_puppetObject) return;
+    unsigned int pose = GetAttributeValue(g_puppetObject, 0x10E80688);
+    if (!Plausible(reinterpret_cast<void*>(pose))) return;
+    if (ReadU32(reinterpret_cast<void*>(pose), 0x14) != g_poseJoints) return;
+    unsigned int rotations = ReadU32(reinterpret_cast<void*>(pose), 0x18);
+    unsigned int translations = ReadU32(reinterpret_cast<void*>(pose), 0x1C);
+    if (!Plausible(reinterpret_cast<void*>(rotations)) || !Plausible(reinterpret_cast<void*>(translations)))
+        return;
+    for (unsigned int i = 0; i < g_poseJoints; ++i)
+    {
+        memcpy(reinterpret_cast<void*>(rotations + i * 16), g_poseBuffer + i * 32, 16);
+        memcpy(reinterpret_cast<void*>(translations + i * 16), g_poseBuffer + i * 32 + 16, 16);
+    }
+    *(unsigned char*)(pose + 0x40) |= 3;
+    reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006DD6E0))(reinterpret_cast<void*>(pose));
+    using CopyPoseFn = void (__thiscall*)(void*, void*);
+    reinterpret_cast<CopyPoseFn>(At<void*>(0x007E8740))(
+        reinterpret_cast<unsigned char*>(self) + 0x14, reinterpret_cast<void*>(pose));
+    if ((g_poseApplied++ % 3000) == 0)
+        Log("pose applied: %u joints", g_poseJoints);
+}
+
 static void* __attribute__((force_align_arg_pointer)) __thiscall HookOpen(void* self, unsigned char kind, unsigned int a, unsigned int b)
 {
     if (self == &g_fakeChannelManager)
@@ -900,6 +984,11 @@ static void StartFakeSession()
 
 static void HandlePacket(const unsigned char* data, int length)
 {
+    if (length >= 4 && data[0] == 'A' && data[1] == '1')
+    {
+        StorePose(data, length);
+        return;
+    }
     if (length >= 8 && memcmp(data, "P1", 2) == 0)
     {
         short sx = 0, sy = 0, sz = 0;
@@ -924,7 +1013,7 @@ static void PollSocket()
     if (g_socket == INVALID_SOCKET) return;
     for (int i = 0; i < 16; ++i)
     {
-        unsigned char buffer[64];
+        unsigned char buffer[8192];
         sockaddr_in from = {};
         int fromSize = sizeof(from);
         int received = recvfrom(g_socket, (char*)buffer, sizeof(buffer), 0, (sockaddr*)&from, &fromSize);
@@ -971,6 +1060,8 @@ static void FrameTick()
         // ~20 Hz keeps the remote avatar close to its real position.
         if ((g_updateCalls % 3) == 0)
             SendPlayerTransform();
+        if ((g_updateCalls % 3) == 1)
+            SendPose();
     }
     if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
     {
@@ -1206,6 +1297,7 @@ static void InstallHooks()
     Install("ApplySyncMessage", At<void*>(0x00833450), (void*)&HookApplySync, (void**)&g_applySync);
     Install("GameObjectSpawner::Create", At<void*>(0x007F25C0), (void*)&HookCreateSpawned, (void**)&g_createSpawned);
     Install("ControllerSystem::Update", At<void*>(0x00643A20), (void*)&HookControllerUpdate, (void**)&g_controllerUpdate);
+    Install("RenderBehaviour::Update", At<void*>(0x008627B0), (void*)&HookRenderUpdate, (void**)&g_renderUpdate);
     g_sendSyncMessage = At<SendSyncMessageFn>(0x00833790);
     g_getPlayerObject = At<GetPlayerObjectFn>(0x00099560);
     g_findTemplate = At<void*>(0x00374650);
