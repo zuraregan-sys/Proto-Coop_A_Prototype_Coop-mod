@@ -500,6 +500,10 @@ static void SpawnPuppet()
     *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = handle;
     g_puppetObject = object;
     ClearAttributeByVtable(object, 0x10D9653C); // choreo::Puppet*
+    // A full player object would fight: disable its behaviours so it can only be
+    // a visual body.
+    reinterpret_cast<void (__thiscall*)(void*, bool)>(At<void*>(0x007E0960))(object, false);
+    Log("spawn: behaviours disabled");
     void* player1 = g_getPlayerObject ? g_getPlayerObject(1) : nullptr;
     Log("spawn: index=%u gen=%u handle=%08X p1=%p at %.1f %.1f %.1f", objectIndex, generation, handle,
         player1, position[0], position[1], position[2]);
@@ -663,7 +667,9 @@ static void __cdecl HookUpdateSync()
                 y = py;
                 z = pz;
                 if (g_puppetLocal == 1)
-                    y += 2.0f;
+                    y += 1.0f;
+                else if (g_puppetLocal == 3)
+                    x += 1.5f;
             }
         }
         SetObjectPosition(g_puppetObject, x, y, z);
