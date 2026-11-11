@@ -1376,6 +1376,25 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookControllerUp
     reinterpret_cast<void (__thiscall*)(void*)>(g_controllerUpdate)(self);
 }
 
+// Everything the plugin cached belongs to one loaded mission: the player
+// object, its template, the spawn records and the streamed pose. Going back to
+// the menu and loading again invalidates all of it.
+static void ResetCoopState()
+{
+    g_puppetObject = nullptr;
+    g_puppetHandle = 0xFFFF;
+    g_puppetSpawned = false;
+    g_spawnPending = false;
+    g_playerTemplate = nullptr;
+    g_poseValid = false;
+    g_remoteBasisValid = false;
+    g_attrDumped = false;
+    g_puppetPlaced = false;
+    g_spawnCount = 0;
+    if (g_engine != nullptr)
+        *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = 0xFFFF;
+}
+
 static void FrameTick()
 {
     // Both tick sources (engine sync and the controller) may fire in one frame.
@@ -1384,6 +1403,20 @@ static void FrameTick()
     g_lastTick = now;
     g_tickCount++;
     g_phase = 1;
+
+    // A new mission (or a respawn) gives a new player object: everything we
+    // cached for the old one is stale.
+    static void* lastPlayer = nullptr;
+    void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if (localPlayer != nullptr && localPlayer != lastPlayer)
+    {
+        if (lastPlayer != nullptr)
+        {
+            Log("world: local player changed %p -> %p, resetting", lastPlayer, localPlayer);
+            ResetCoopState();
+        }
+        lastPlayer = localPlayer;
+    }
 
     // The puppet can die (the city war does not spare it). When its handle no
     // longer resolves, drop it: using the stale pointer aborts the engine.
