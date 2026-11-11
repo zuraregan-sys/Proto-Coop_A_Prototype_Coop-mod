@@ -133,7 +133,10 @@ static void* g_getText = nullptr;
 static bool g_spawnPending = false;
 static bool g_puppetSpawned = false;
 static bool g_attrDumped = false;
-static void* g_puppetObject = nullptr;static bool g_remoteValid = false;
+static void* g_puppetObject = nullptr;
+static unsigned int g_puppetHandle = 0xFFFF;
+static unsigned int g_effectSendCount = 0;
+static bool g_remoteValid = false;
 static float g_puppetX = 0.0f, g_puppetY = 0.0f, g_puppetZ = 0.0f;
 static bool g_puppetPlaced = false;
 static float g_remoteX = 0.0f, g_remoteY = 0.0f, g_remoteZ = 0.0f;
@@ -877,6 +880,7 @@ static void SpawnPuppet()
     if (objectIndex != 0xFFFF && Plausible(reinterpret_cast<void*>(tableAddress)))
         generation = *(unsigned short*)(tableAddress + objectIndex * 8 + 4);
     unsigned int handle = objectIndex | (generation << 16);
+    g_puppetHandle = handle;
     *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = handle;
     g_puppetObject = object;
     void* playerObject = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
@@ -952,6 +956,56 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookRenderUpdate
         reinterpret_cast<unsigned char*>(self) + 0x14, reinterpret_cast<void*>(pose));
     if ((g_poseApplied++ % 3000) == 0)
         Log("pose applied: %u joints", g_poseJoints);
+}
+
+static void* g_startEffect = nullptr;
+static unsigned int g_effectRecvCount = 0;
+
+static void SpawnRemoteEffect(const unsigned char* data, int length)
+{
+    if (length < 10 + 0x40 || g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
+    void* manager = reinterpret_cast<void* (*)()>(At<void*>(0x008193A0))();
+    if (!Plausible(manager)) return;
+    unsigned char setup[0xC0];
+    reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x00820080))(setup);
+    memcpy(setup, data + 10, 0xA0);
+    memcpy(setup + 0x48, &g_puppetHandle, 4);
+    unsigned char out[4] = { 0, 0, 0, 0 };
+    unsigned int nameCopy[2];
+    memcpy(nameCopy, data + 2, 8);
+    nameCopy[1] = 0; // the registry index is per process; the hash is the same
+    reinterpret_cast<void (__thiscall*)(void*, void*, const void*, void*)>(At<void*>(0x0081E6B0))(
+        manager, out, nameCopy, setup);
+    if ((g_effectRecvCount++ % 50) == 0)
+        Log("effect recv #%u", g_effectRecvCount);
+}
+
+static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect(void* self, void* out, const void* name, void* setup)
+{
+    void* result = reinterpret_cast<void* (__thiscall*)(void*, void*, const void*, void*)>(g_startEffect)(
+        self, out, name, setup);
+    if (!g_transportReady || setup == nullptr || name == nullptr || g_engine == nullptr) return result;
+    unsigned int target = ReadU32(setup, 0x48);
+    unsigned int playerHandle = ReadU32(g_engine, 0x126E40C);
+    if (target == 0 || target == 0xFFFF || target != playerHandle) return result;
+    static unsigned int windowStart = 0;
+    static unsigned int windowCount = 0;
+    unsigned int now = GetTickCount();
+    if (now - windowStart > 1000)
+    {
+        windowStart = now;
+        windowCount = 0;
+    }
+    if (++windowCount > 60) return result;
+    unsigned char packet[2 + 8 + 0xA0];
+    packet[0] = 'E';
+    packet[1] = '1';
+    memcpy(packet + 2, name, 8);
+    memcpy(packet + 10, setup, 0xA0);
+    sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+    if ((++g_effectSendCount % 100) == 0)
+        Log("effect send #%u", g_effectSendCount);
+    return result;
 }
 
 static void* __attribute__((force_align_arg_pointer)) __thiscall HookOpen(void* self, unsigned char kind, unsigned int a, unsigned int b)
@@ -1044,6 +1098,11 @@ static void StartFakeSession()
 
 static void HandlePacket(const unsigned char* data, int length)
 {
+    if (length >= 10 && data[0] == 'E' && data[1] == '1')
+    {
+        SpawnRemoteEffect(data, length);
+        return;
+    }
     if (length >= 4 && data[0] == 'R' && data[1] == '1')
     {
         StoreRotation(data, length);
@@ -1400,6 +1459,7 @@ static void InstallHooks()
     Install("GameObjectSpawner::Create", At<void*>(0x007F25C0), (void*)&HookCreateSpawned, (void**)&g_createSpawned);
     Install("ControllerSystem::Update", At<void*>(0x00643A20), (void*)&HookControllerUpdate, (void**)&g_controllerUpdate);
     Install("RenderBehaviour::Update", At<void*>(0x008627B0), (void*)&HookRenderUpdate, (void**)&g_renderUpdate);
+    Install("EffectManager::StartEffect", At<void*>(0x0081E6B0), (void*)&HookStartEffect, (void**)&g_startEffect);
     g_sendSyncMessage = At<SendSyncMessageFn>(0x00833790);
     g_getPlayerObject = At<GetPlayerObjectFn>(0x00099560);
     g_findTemplate = At<void*>(0x00374650);
