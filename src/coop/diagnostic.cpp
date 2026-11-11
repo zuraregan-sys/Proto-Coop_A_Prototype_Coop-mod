@@ -70,6 +70,9 @@ static int g_puppetLog = 0;
 static bool g_followLog = false;
 static bool g_debugIntention = false;
 static bool g_logSpawns = false;
+static bool g_dumpHealth = false;
+static float g_testMass = 0.0f;
+static bool g_logEffects = false;
 static float g_intentTest = 0.0f;
 static bool g_fakeSession = false;
 static bool g_puppetStatic = false;
@@ -165,6 +168,9 @@ static void ReadConfig()
     g_followLog = GetPrivateProfileIntA("coop", "follow_log", 0, path) != 0;
     g_debugIntention = GetPrivateProfileIntA("coop", "debug_intention", 0, path) != 0;
     g_logSpawns = GetPrivateProfileIntA("coop", "log_spawns", 0, path) != 0;
+    g_dumpHealth = GetPrivateProfileIntA("coop", "dump_health", 0, path) != 0;
+    g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
+    g_logEffects = GetPrivateProfileIntA("coop", "log_effects", 0, path) != 0;
     g_intentTest = (float)GetPrivateProfileIntA("coop", "intent_test", 0, path);
     g_fakeSession = GetPrivateProfileIntA("coop", "fake_session", 0, path) != 0;
     g_puppetStatic = GetPrivateProfileIntA("coop", "puppet_static", 0, path) != 0;
@@ -742,6 +748,23 @@ static void PokeIntention(void* object, float value)
     *(float*)(axes + 24) = value;
 }
 
+// Dumps the floats of the player's health behaviour around the devastator cost,
+// where the critical mass meter is expected to live.
+static void DumpHealthBehaviour(void* object)
+{
+    void* behaviour = FindBehaviourByName(object, "PrototypeHealthBehaviour");
+    if (behaviour == nullptr)
+    {
+        Log("health: no PrototypeHealthBehaviour");
+        return;
+    }
+    for (unsigned int offset = 0x1A8; offset <= 0x238; offset += 0x10)
+    {
+        const float* values = reinterpret_cast<const float*>(reinterpret_cast<unsigned char*>(behaviour) + offset);
+        Log("health: +%03X %.2f %.2f %.2f %.2f", offset, values[0], values[1], values[2], values[3]);
+    }
+}
+
 // The template copy gives the puppet the player's own animation objects. Sharing
 // the choreo puppet drives the player's pose a second time, so the puppet gets
 // it cleared: it still draws, but it no longer animates the player.
@@ -969,7 +992,9 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
     unsigned char setup[0xC0];
     reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x00820080))(setup);
     memcpy(setup, data + 10, 0xA0);
-    memcpy(setup + 0x48, &g_puppetHandle, 4);
+    // World effects keep their own target; attached ones follow the puppet.
+    if (ReadU32(setup, 0x48) != 0xFFFF)
+        memcpy(setup + 0x48, &g_puppetHandle, 4);
     unsigned char out[4] = { 0, 0, 0, 0 };
     unsigned int nameCopy[2];
     memcpy(nameCopy, data + 2, 8);
@@ -986,8 +1011,25 @@ static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect
         self, out, name, setup);
     if (!g_transportReady || setup == nullptr || name == nullptr || g_engine == nullptr) return result;
     unsigned int target = ReadU32(setup, 0x48);
+    if (g_logEffects)
+        Log("fx: name=%08X target=%08X pos=%.1f %.1f %.1f", ReadU32(name, 0), target,
+            *(const float*)((const unsigned char*)setup + 0x30), *(const float*)((const unsigned char*)setup + 0x34), *(const float*)((const unsigned char*)setup + 0x38));
     unsigned int playerHandle = ReadU32(g_engine, 0x126E40C);
-    if (target == 0 || target == 0xFFFF || target != playerHandle) return result;
+    bool forward = target != 0 && target == playerHandle;
+    if (!forward && target == 0xFFFF)
+    {
+        // World effect: only the ones around the local player matter (power
+        // effects at the caster), not the distant ambient war.
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        if (ReadPlayerPosition(&px, &py, &pz))
+        {
+            float dx = *(const float*)((const unsigned char*)setup + 0x30) - px;
+            float dy = *(const float*)((const unsigned char*)setup + 0x34) - py;
+            float dz = *(const float*)((const unsigned char*)setup + 0x38) - pz;
+            if (dx * dx + dy * dy + dz * dz < 400.0f) forward = true;
+        }
+    }
+    if (!forward) return result;
     static unsigned int windowStart = 0;
     static unsigned int windowCount = 0;
     unsigned int now = GetTickCount();
@@ -1220,6 +1262,17 @@ static void FrameTick()
             Log("puppet: player=%d %.2f %.2f %.2f puppet=%d %.2f %.2f %.2f", playerOk ? 1 : 0, px, py, pz,
                 puppetOk ? 1 : 0, qx, qy, qz);
         }
+    }
+    if (g_dumpHealth && g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
+    {
+        void* localPlayer = g_getPlayerObject(0);
+        if (localPlayer != nullptr) DumpHealthBehaviour(localPlayer);
+    }
+    if (g_testMass > 0.0f && g_getPlayerObject != nullptr)
+    {
+        void* localPlayer = g_getPlayerObject(0);
+        void* health = localPlayer != nullptr ? FindBehaviourByName(localPlayer, "PrototypeHealthBehaviour") : nullptr;
+        if (health != nullptr) *(float*)((char*)health + 0x228) = g_testMass;
     }
     if (g_debugIntention && (g_updateCalls % 15) == 0)
     {
