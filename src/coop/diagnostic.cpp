@@ -51,8 +51,10 @@ static sockaddr_in g_peer;
 static unsigned short g_localPort = 27016;
 static unsigned short g_peerPort = 27017;
 static bool g_isHost = true;
-static bool g_testMove = false;
+static int g_testMove = 0;
 static bool g_testMoved = false;
+static float g_testOffsetY = 0.0f;
+static int g_puppetLocal = 0;
 static unsigned int g_heartbeat = 0;
 
 static void Log(const char* format, ...)
@@ -113,9 +115,7 @@ static void* g_getText = nullptr;
 static bool g_spawnPending = false;
 static bool g_puppetSpawned = false;
 static bool g_attrDumped = false;
-static void* g_puppetObject = nullptr;
-static bool g_remoteValid = false;
-static bool g_localOffsetTest = false;
+static void* g_puppetObject = nullptr;static bool g_remoteValid = false;
 static float g_remoteX = 0.0f, g_remoteY = 0.0f, g_remoteZ = 0.0f;
 
 static void __thiscall HookSend(void* self, int target, int type, const void* data, unsigned int length, int flag);
@@ -135,8 +135,11 @@ static void ReadConfig()
     g_localPort = (unsigned short)GetPrivateProfileIntA("coop", "port", g_isHost ? 27016 : 27017, path);
     g_peerPort = (unsigned short)GetPrivateProfileIntA("coop", "peer_port", g_isHost ? 27017 : 27016, path);
     g_peerMask = g_isHost ? 1 : 2;
-    g_testMove = GetPrivateProfileIntA("coop", "test_move", 0, path) != 0;
-    Log("config role=%s local=%u peer=%u mask=%d", g_isHost ? "host" : "client", g_localPort, g_peerPort, g_peerMask);
+    g_testMove = GetPrivateProfileIntA("coop", "test_move", 0, path);
+    g_testOffsetY = (float)GetPrivateProfileIntA("coop", "test_offset_y", 0, path);
+    g_puppetLocal = GetPrivateProfileIntA("coop", "puppet_local", 0, path);
+    Log("config role=%s local=%u peer=%u mask=%d offset_y=%.0f", g_isHost ? "host" : "client", g_localPort,
+        g_peerPort, g_peerMask, g_testOffsetY);
 }
 
 static bool InitSocket()
@@ -226,9 +229,13 @@ static void SendPlayerTransform()
     float x = 0.0f, y = 0.0f, z = 0.0f;
     if (!ReadPlayerPosition(&x, &y, &z)) return;
     unsigned char packet[8] = { 'P', '1', 0, 0, 0, 0, 0, 0 };
-    int qx = (int)(x * 32.0f);
-    int qy = (int)(y * 32.0f);
-    int qz = (int)(z * 32.0f);
+    if (g_testOffsetY != 0.0f && (g_updateCalls % 600) == 0)
+        Log("send: offset_y=%.1f before=%.2f", g_testOffsetY, y);
+    y += g_testOffsetY;
+    // 1/8 unit steps: +-4096 units, enough for the whole city, 12 cm accuracy.
+    int qx = (int)(x * 8.0f);
+    int qy = (int)(y * 8.0f);
+    int qz = (int)(z * 8.0f);
     if (qx > 32767) qx = 32767; if (qx < -32768) qx = -32768;
     if (qy > 32767) qy = 32767; if (qy < -32768) qy = -32768;
     if (qz > 32767) qz = 32767; if (qz < -32768) qz = -32768;
@@ -404,6 +411,29 @@ static void* FindInventoryTemplateByHash(unsigned int hash)
     return nullptr;
 }
 
+// The template copy gives the puppet the player's own animation objects. Sharing
+// the choreo puppet drives the player's pose a second time, so the puppet gets
+// it cleared: it still draws, but it no longer animates the player.
+static void ClearAttributeByVtable(void* object, unsigned int vtable)
+{
+    if (object == nullptr) return;
+    unsigned int begin = ReadU32(object, 8);
+    unsigned int end = ReadU32(object, 0xC);
+    if (!Plausible(reinterpret_cast<void*>(begin)) || end < begin) return;
+    unsigned int count = (end - begin) / 16;
+    for (unsigned int i = 0; i < count && i < 64; ++i)
+    {
+        unsigned char* entry = reinterpret_cast<unsigned char*>(begin) + i * 16;
+        unsigned int attribute = *(unsigned int*)(entry + 8);
+        if (attribute == 0 || !Plausible(reinterpret_cast<void*>(attribute + 4))) continue;
+        if (*(unsigned int*)attribute == vtable)
+        {
+            *(unsigned int*)(attribute + 4) = 0;
+            Log("attrs: cleared %08X on %p", vtable, object);
+        }
+    }
+}
+
 static void SpawnPuppet()
 {
     Log("spawn: begin pending=%d spawned=%d", g_spawnPending ? 1 : 0, g_puppetSpawned ? 1 : 0);
@@ -416,11 +446,19 @@ static void SpawnPuppet()
     }
     using SetPositionFn = void (__thiscall*)(void*, const float*);
 
-    void* tmpl = FindSpawnedTemplateByHash(0x2C48D34E); // "Soldier"
-    if (tmpl == nullptr)
-        tmpl = FindInventoryTemplateByHash(0x2C48D34E);
+    // Prefer the player's own template: with an Alex model the puppet is
+    // visible, and it stands where the remote player stands.
+    void* tmpl = g_playerTemplate;
     if (tmpl != nullptr)
-        Log("spawn: using Soldier template %p", tmpl);
+        Log("spawn: using player template %p", tmpl);
+    if (tmpl == nullptr)
+    {
+        tmpl = FindSpawnedTemplateByHash(0x2C48D34E); // "Soldier"
+        if (tmpl == nullptr)
+            tmpl = FindInventoryTemplateByHash(0x2C48D34E);
+        if (tmpl != nullptr)
+            Log("spawn: using Soldier template %p", tmpl);
+    }
     if (tmpl == nullptr)
     {
         tmpl = FindSpawnedTemplateByHash(0xA5B3FA51); // "Brawler"
@@ -461,6 +499,7 @@ static void SpawnPuppet()
     unsigned int handle = objectIndex | (generation << 16);
     *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = handle;
     g_puppetObject = object;
+    ClearAttributeByVtable(object, 0x10D9653C); // choreo::Puppet*
     void* player1 = g_getPlayerObject ? g_getPlayerObject(1) : nullptr;
     Log("spawn: index=%u gen=%u handle=%08X p1=%p at %.1f %.1f %.1f", objectIndex, generation, handle,
         player1, position[0], position[1], position[2]);
@@ -595,29 +634,36 @@ static void __cdecl HookUpdateSync()
     }
     g_updateCalls++;
     g_updateSync();
-    if (g_isHost && g_testMove && !g_testMoved && g_updateCalls > 6000)
+    if (g_isHost && g_testMove != 0 && !g_testMoved && g_updateCalls > 6000)
     {
         float x = 0.0f, y = 0.0f, z = 0.0f;
         if (ReadPlayerPosition(&x, &y, &z))
         {
-            SetObjectPosition(g_getPlayerObject(0), x + 6.0f, y, z);
-            Log("test: moved host player to %.2f %.2f %.2f", x + 6.0f, y, z);
+            float dx = 0.0f, dy = 0.0f, dz = 0.0f;
+            if (g_testMove == 1) dx = 3.0f;
+            else if (g_testMove == 2) dx = -3.0f;
+            else if (g_testMove == 3) dz = 3.0f;
+            else if (g_testMove == 4) dz = -3.0f;
+            SetObjectPosition(g_getPlayerObject(0), x + dx, y + dy, z + dz);
+            Log("test: moved host player to %.2f %.2f %.2f (mode %d)", x + dx, y + dy, z + dz, g_testMove);
             g_testMoved = true;
         }
     }
     if (g_spawnPending && !g_puppetSpawned)
         SpawnPuppet();
-    if (g_puppetObject != nullptr && (g_updateCalls % 2) == 0)
+    if (g_puppetObject != nullptr)
     {
-        float x = g_remoteX + 2.0f, y = g_remoteY, z = g_remoteZ;
-        if (g_localOffsetTest)
+        float x = g_remoteX, y = g_remoteY, z = g_remoteZ;
+        if (g_puppetLocal != 0 || !g_remoteValid)
         {
             float px = 0.0f, py = 0.0f, pz = 0.0f;
             if (ReadPlayerPosition(&px, &py, &pz))
             {
-                x = px + 3.0f;
+                x = px;
                 y = py;
                 z = pz;
+                if (g_puppetLocal == 1)
+                    y += 2.0f;
             }
         }
         SetObjectPosition(g_puppetObject, x, y, z);
@@ -638,10 +684,10 @@ static void* __cdecl HookApplySync(const unsigned int* machines, int type, const
         memcpy(&sx, bytes + 2, 2);
         memcpy(&sy, bytes + 4, 2);
         memcpy(&sz, bytes + 6, 2);
-        Log("transform client %.2f %.2f %.2f", sx / 32.0f, sy / 32.0f, sz / 32.0f);
-        g_remoteX = sx / 32.0f;
-        g_remoteY = sy / 32.0f;
-        g_remoteZ = sz / 32.0f;
+        Log("transform client %.2f %.2f %.2f", sx / 8.0f, sy / 8.0f, sz / 8.0f);
+        g_remoteX = sx / 8.0f;
+        g_remoteY = sy / 8.0f;
+        g_remoteZ = sz / 8.0f;
         g_remoteValid = true;
         return nullptr;
     }
