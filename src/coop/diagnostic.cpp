@@ -64,6 +64,8 @@ static int g_testWalk = 0;
 static int g_testWalkLeft = 0;
 static int g_puppetLog = 0;
 static bool g_followLog = false;
+static bool g_debugIntention = false;
+static float g_intentTest = 0.0f;
 static bool g_fakeSession = false;
 static bool g_puppetStatic = false;
 static unsigned int g_heartbeat = 0;
@@ -153,6 +155,8 @@ static void ReadConfig()
     g_puppetLocal = GetPrivateProfileIntA("coop", "puppet_local", 0, path);
     g_testWalk = GetPrivateProfileIntA("coop", "test_walk", 0, path);
     g_followLog = GetPrivateProfileIntA("coop", "follow_log", 0, path) != 0;
+    g_debugIntention = GetPrivateProfileIntA("coop", "debug_intention", 0, path) != 0;
+    g_intentTest = (float)GetPrivateProfileIntA("coop", "intent_test", 0, path);
     g_fakeSession = GetPrivateProfileIntA("coop", "fake_session", 0, path) != 0;
     g_puppetStatic = GetPrivateProfileIntA("coop", "puppet_static", 0, path) != 0;
     Log("config role=%s local=%u peer=%u mask=%d offset_y=%.0f", g_isHost ? "host" : "client", g_localPort,
@@ -561,6 +565,88 @@ static void DisableCombatBehaviours(void* object)
     Log("beh: no behaviour list found to disable");
 }
 
+static void* FindBehaviourByName(void* object, const char* wanted)
+{
+    if (object == nullptr) return nullptr;
+    unsigned char* controller = reinterpret_cast<unsigned char*>(object) + 0x20;
+    for (unsigned int offset = 0; offset <= 0x40; offset += 4)
+    {
+        unsigned int begin = ReadU32(controller, offset);
+        unsigned int end = ReadU32(controller, offset + 4);
+        if (!Plausible(reinterpret_cast<void*>(begin)) || end < begin) continue;
+        unsigned int count = (end - begin) / 4;
+        if (count == 0 || count > 64) continue;
+        bool ownerMatches = true;
+        for (unsigned int i = 0; i < count && ownerMatches; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            if (!Plausible(behaviour) ||
+                (ReadU32(behaviour, 0) != reinterpret_cast<unsigned int>(object) &&
+                 ReadU32(behaviour, 4) != reinterpret_cast<unsigned int>(object)))
+                ownerMatches = false;
+        }
+        if (!ownerMatches) continue;
+        for (unsigned int i = 0; i < count; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            const char* name = RttiName(behaviour);
+            if (name != nullptr && strstr(name, wanted) != nullptr)
+                return behaviour;
+        }
+        return nullptr;
+    }
+    return nullptr;
+}
+
+// Dumps the character's intention state (behaviour+0x10, 0x58 bytes) so the
+// movement axes can be told apart from the rest of the fields.
+static void DumpIntention(void* object, const char* tag)
+{
+    void* behaviour = FindBehaviourByName(object, "CharacterIntentionBehaviour");
+    if (behaviour == nullptr)
+    {
+        Log("intent(%s): no behaviour", tag);
+        return;
+    }
+    const unsigned int* words = reinterpret_cast<const unsigned int*>(reinterpret_cast<unsigned char*>(behaviour) + 0x10);
+    Log("intent(%s): behaviour=%p words %08X %08X %08X %08X %08X %08X %08X %08X", tag, behaviour,
+        words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    unsigned int buttons = words[4];
+    unsigned int axes = words[7];
+    if (Plausible(reinterpret_cast<void*>(axes)))
+    {
+        Log("intent(%s): axes=%p [0]=%.2f %.2f [1]=%.2f %.2f [2]=%.2f %.2f [3]=%.2f %.2f", tag,
+            reinterpret_cast<void*>(axes),
+            *(const float*)(axes + 0), *(const float*)(axes + 4),
+            *(const float*)(axes + 8), *(const float*)(axes + 12),
+            *(const float*)(axes + 16), *(const float*)(axes + 20),
+            *(const float*)(axes + 24), *(const float*)(axes + 28));
+    }
+    if (Plausible(reinterpret_cast<void*>(buttons)))
+    {
+        Log("intent(%s): buttons=%p [0]=%d %.2f [1]=%d %.2f [2]=%d %.2f [3]=%d %.2f", tag,
+            reinterpret_cast<void*>(buttons),
+            *(const int*)(buttons + 0), *(const float*)(buttons + 4),
+            *(const int*)(buttons + 12), *(const float*)(buttons + 16),
+            *(const int*)(buttons + 24), *(const float*)(buttons + 28),
+            *(const int*)(buttons + 36), *(const float*)(buttons + 40));
+    }
+}
+
+// Pokes the character's intention axes: used to find which axis drives the
+// locomotion animations.
+static void PokeIntention(void* object, float value)
+{
+    void* behaviour = FindBehaviourByName(object, "CharacterIntentionBehaviour");
+    if (behaviour == nullptr) return;
+    unsigned int axes = ReadU32(reinterpret_cast<unsigned char*>(behaviour) + 0x10, 0x1C);
+    if (!Plausible(reinterpret_cast<void*>(axes))) return;
+    *(float*)(axes + 0) = value;
+    *(float*)(axes + 8) = value;
+    *(float*)(axes + 16) = value;
+    *(float*)(axes + 24) = value;
+}
+
 // The template copy gives the puppet the player's own animation objects. Sharing
 // the choreo puppet drives the player's pose a second time, so the puppet gets
 // it cleared: it still draws, but it no longer animates the player.
@@ -917,6 +1003,12 @@ static void FrameTick()
                 puppetOk ? 1 : 0, qx, qy, qz);
         }
     }
+    if (g_debugIntention && (g_updateCalls % 15) == 0)
+    {
+        void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+        if (localPlayer != nullptr)
+            DumpIntention(localPlayer, "local");
+    }
     g_updateCalls++;
     if (g_started)
         g_updateSync();
@@ -1017,6 +1109,8 @@ static void FrameTick()
         }
         if (g_followLog && (g_updateCalls % 15) == 0)
             Log("follow: puppet %.2f %.2f %.2f target %.2f %.2f %.2f", g_puppetX, g_puppetY, g_puppetZ, x, y, z);
+        if (g_intentTest != 0.0f)
+            PokeIntention(g_puppetObject, g_intentTest);
         SetObjectPosition(g_puppetObject, g_puppetX, g_puppetY, g_puppetZ);
     }
 }
