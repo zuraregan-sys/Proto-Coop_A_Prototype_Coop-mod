@@ -1390,7 +1390,8 @@ static void ResetCoopState()
     g_remoteBasisValid = false;
     g_attrDumped = false;
     g_puppetPlaced = false;
-    g_spawnCount = 0;
+    // Keep the spawn records: the new player object was already recorded by the
+    // spawn hook, and the template is found through them again.
     if (g_engine != nullptr)
         *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = 0xFFFF;
 }
