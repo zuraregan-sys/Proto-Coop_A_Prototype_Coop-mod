@@ -69,6 +69,7 @@ static int g_testWalkLeft = 0;
 static int g_puppetLog = 0;
 static bool g_followLog = false;
 static bool g_debugIntention = false;
+static bool g_logSpawns = false;
 static float g_intentTest = 0.0f;
 static bool g_fakeSession = false;
 static bool g_puppetStatic = false;
@@ -160,6 +161,7 @@ static void ReadConfig()
     g_testWalk = GetPrivateProfileIntA("coop", "test_walk", 0, path);
     g_followLog = GetPrivateProfileIntA("coop", "follow_log", 0, path) != 0;
     g_debugIntention = GetPrivateProfileIntA("coop", "debug_intention", 0, path) != 0;
+    g_logSpawns = GetPrivateProfileIntA("coop", "log_spawns", 0, path) != 0;
     g_intentTest = (float)GetPrivateProfileIntA("coop", "intent_test", 0, path);
     g_fakeSession = GetPrivateProfileIntA("coop", "fake_session", 0, path) != 0;
     g_puppetStatic = GetPrivateProfileIntA("coop", "puppet_static", 0, path) != 0;
@@ -1353,6 +1355,22 @@ static void* __attribute__((force_align_arg_pointer)) __cdecl HookCreateSpawned(
             name != nullptr ? *(const unsigned int*)((const unsigned char*)name + 4) : 0,
             name != nullptr ? *(const unsigned int*)name : 0,
             object, object != nullptr ? *(unsigned int*)object : 0);
+    if (g_logSpawns && object != nullptr)
+    {
+        const char* className = RttiName(object);
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        float ox = 0.0f, oy = 0.0f, oz = 0.0f;
+        void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+        bool havePlayer = player != nullptr && ReadObjectPosition(player, &px, &py, &pz);
+        bool haveObject = ReadObjectPosition(object, &ox, &oy, &oz);
+        float dx = havePlayer && haveObject ? ox - px : 0.0f;
+        float dy = havePlayer && haveObject ? oy - py : 0.0f;
+        float dz = havePlayer && haveObject ? oz - pz : 0.0f;
+        float distance = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (!havePlayer || !haveObject || distance < 12.0f)
+            Log("spawn+: u=%u d=%.1f hash=%08X class=%s", g_updateCalls, distance, ReadU32(tmpl, 0x10),
+                className != nullptr ? className : "(none)");
+    }
     return object;
 }
 
