@@ -1496,6 +1496,7 @@ static void SendTransformState()
     int count = ReadTransformSlots(player, state, 8);
     if (count <= 0) return;
     unsigned int now = GetTickCount();
+    if (g_localTransformTick != 0 && now - g_localTransformTick < 2000) return;
     bool changed = count != g_lastSentSlotCount;
     if (!changed)
     {
@@ -1558,6 +1559,7 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
     if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
     void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     if (localPlayer != nullptr && IsPowerWheelOpen(localPlayer)) return;
+    if (g_localTransformTick != 0 && GetTickCount() - g_localTransformTick < 2000) return;
     void* behaviour = FindBehaviourByName(g_puppetObject, "TransformationBehaviour");
     if (behaviour == nullptr) return;
     g_remoteTransformation = 1;
@@ -1796,13 +1798,40 @@ static void FrameTick()
     // The local player's transformation also leaks into the local puppet (they
     // share the transformation template). Reapply the peer's real state a
     // moment later, once the local animation has finished.
-    if (g_localTransformTick != 0 && GetTickCount() - g_localTransformTick > 1500)
+    if (g_localTransformTick != 0 && GetTickCount() - g_localTransformTick > 2500)
     {
         g_localTransformTick = 0;
+        void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+        if (localPlayer != nullptr && g_puppetObject != nullptr && g_puppetHandle != 0xFFFF)
+        {
+            TransformSlotState local[8];
+            TransformSlotState shown[8];
+            int localCount = ReadTransformSlots(localPlayer, local, 8);
+            int shownCount = ReadTransformSlots(g_puppetObject, shown, 8);
+            g_remoteTransformation = 1;
+            for (int i = 0; i < localCount; ++i)
+            {
+                if (!local[i].active) continue;
+                bool remoteActive = false;
+                for (int k = 0; k < g_remoteSlotCount; ++k)
+                    if (memcmp(g_remoteSlots[k].slot, local[i].slot, 8) == 0 && g_remoteSlots[k].active)
+                        remoteActive = true;
+                if (remoteActive) continue;
+                bool shownActive = false;
+                for (int k = 0; k < shownCount; ++k)
+                    if (memcmp(shown[k].slot, local[i].slot, 8) == 0)
+                        shownActive = shown[k].active != 0;
+                if (shownActive)
+                {
+                    unsigned int slotName[2];
+                    memcpy(slotName, local[i].slot, 8);
+                    SendTransformStart(g_puppetObject, slotName, false);
+                }
+            }
+            g_remoteTransformation = 0;
+        }
         if (g_remoteSlotCount > 0)
             ApplyTransformState(g_remoteSlots, g_remoteSlotCount, true);
-        else
-            ResetPuppetTransformations();
     }
     if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
     {
