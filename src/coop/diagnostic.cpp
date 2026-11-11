@@ -55,6 +55,7 @@ static int g_testMove = 0;
 static bool g_testMoved = false;
 static float g_testOffsetY = 0.0f;
 static int g_puppetLocal = 0;
+static bool g_puppetStatic = false;
 static unsigned int g_heartbeat = 0;
 
 static void Log(const char* format, ...)
@@ -138,6 +139,7 @@ static void ReadConfig()
     g_testMove = GetPrivateProfileIntA("coop", "test_move", 0, path);
     g_testOffsetY = (float)GetPrivateProfileIntA("coop", "test_offset_y", 0, path);
     g_puppetLocal = GetPrivateProfileIntA("coop", "puppet_local", 0, path);
+    g_puppetStatic = GetPrivateProfileIntA("coop", "puppet_static", 0, path) != 0;
     Log("config role=%s local=%u peer=%u mask=%d offset_y=%.0f", g_isHost ? "host" : "client", g_localPort,
         g_peerPort, g_peerMask, g_testOffsetY);
 }
@@ -419,6 +421,49 @@ static void* FindInventoryTemplateByHash(unsigned int hash)
 // The template copy gives the puppet the player's own animation objects. Sharing
 // the choreo puppet drives the player's pose a second time, so the puppet gets
 // it cleared: it still draws, but it no longer animates the player.
+static unsigned int GetAttributeValue(void* object, unsigned int vtable)
+{
+    if (object == nullptr) return 0;
+    unsigned int begin = ReadU32(object, 8);
+    unsigned int end = ReadU32(object, 0xC);
+    if (!Plausible(reinterpret_cast<void*>(begin)) || end < begin) return 0;
+    unsigned int count = (end - begin) / 16;
+    for (unsigned int i = 0; i < count && i < 64; ++i)
+    {
+        unsigned char* entry = reinterpret_cast<unsigned char*>(begin) + i * 16;
+        unsigned int attribute = *(unsigned int*)(entry + 8);
+        if (attribute == 0 || !Plausible(reinterpret_cast<void*>(attribute + 4))) continue;
+        if (*(unsigned int*)attribute == vtable)
+            return *(unsigned int*)(attribute + 4);
+    }
+    return 0;
+}
+
+// The template copy gives the puppet the player's own animation drivers, and a
+// driver belongs to one pose: sharing them makes the player's pose stop
+// updating. Give the puppet copies of its own.
+static void ClonePuppetDrivers(void* puppet, void* source)
+{
+    if (puppet == nullptr || source == nullptr) return;
+    unsigned int count = ReadU32(source, 0x190);
+    if (count == 0 || count > 32)
+    {
+        Log("anim: no drivers to clone (count=%u)", count);
+        return;
+    }
+    using RemoveAllFn = void (__thiscall*)(void*, bool);
+    using GetDriverFn = void* (__thiscall*)(const void*, unsigned int);
+    using CopyDriverFromFn = void* (__thiscall*)(void*, void*, void*);
+    reinterpret_cast<RemoveAllFn>(At<void*>(0x009470B0))(puppet, true);
+    for (unsigned int i = 0; i < count; ++i)
+    {
+        void* driver = reinterpret_cast<GetDriverFn>(At<void*>(0x009475C0))(source, i);
+        if (driver != nullptr)
+            reinterpret_cast<CopyDriverFromFn>(At<void*>(0x00947600))(puppet, driver, source);
+    }
+    Log("anim: cloned %u drivers", count);
+}
+
 static void ClearAttributeByVtable(void* object, unsigned int vtable)
 {
     if (object == nullptr) return;
@@ -504,11 +549,21 @@ static void SpawnPuppet()
     unsigned int handle = objectIndex | (generation << 16);
     *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = handle;
     g_puppetObject = object;
-    ClearAttributeByVtable(object, 0x10D9653C); // choreo::Puppet*
-    // A full player object would fight: disable its behaviours so it can only be
-    // a visual body.
-    reinterpret_cast<void (__thiscall*)(void*, bool)>(At<void*>(0x007E0960))(object, false);
-    Log("spawn: behaviours disabled");
+    void* playerObject = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    Log("anim: pose player=%08X puppet=%08X choreo player=%08X puppet=%08X",
+        GetAttributeValue(playerObject, 0x10E80688), GetAttributeValue(object, 0x10E80688),
+        GetAttributeValue(playerObject, 0x10D9653C), GetAttributeValue(object, 0x10D9653C));
+    if (g_puppetStatic)
+    {
+        ClearAttributeByVtable(object, 0x10D9653C); // choreo::Puppet*
+        reinterpret_cast<void (__thiscall*)(void*, bool)>(At<void*>(0x007E0960))(object, false);
+        Log("spawn: puppet is static (behaviours off)");
+    }
+    else
+    {
+        ClonePuppetDrivers(reinterpret_cast<void*>(GetAttributeValue(object, 0x10D9653C)),
+            reinterpret_cast<void*>(GetAttributeValue(playerObject, 0x10D9653C)));
+    }
     void* player1 = g_getPlayerObject ? g_getPlayerObject(1) : nullptr;
     Log("spawn: index=%u gen=%u handle=%08X p1=%p at %.1f %.1f %.1f", objectIndex, generation, handle,
         player1, position[0], position[1], position[2]);
