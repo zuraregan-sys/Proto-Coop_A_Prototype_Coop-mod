@@ -75,6 +75,7 @@ static bool g_debugIntention = false;
 static bool g_logSpawns = false;
 static bool g_dumpHealth = false;
 static float g_testMass = 0.0f;
+static float g_testHealth = 0.0f;
 static bool g_logEffects = false;
 static float g_intentTest = 0.0f;
 static bool g_fakeSession = false;
@@ -173,6 +174,7 @@ static void ReadConfig()
     g_logSpawns = GetPrivateProfileIntA("coop", "log_spawns", 0, path) != 0;
     g_dumpHealth = GetPrivateProfileIntA("coop", "dump_health", 0, path) != 0;
     g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
+    g_testHealth = (float)GetPrivateProfileIntA("coop", "test_health", 0, path);
     g_logEffects = GetPrivateProfileIntA("coop", "log_effects", 0, path) != 0;
     g_intentTest = (float)GetPrivateProfileIntA("coop", "intent_test", 0, path);
     g_fakeSession = GetPrivateProfileIntA("coop", "fake_session", 0, path) != 0;
@@ -1512,6 +1514,18 @@ static void FrameTick()
         void* localPlayer = g_getPlayerObject(0);
         void* health = localPlayer != nullptr ? FindBehaviourByName(localPlayer, "PrototypeHealthBehaviour") : nullptr;
         if (health != nullptr) *(float*)((char*)health + 0x228) = g_testMass;
+    }
+    if (g_testHealth > 0.0f && g_getPlayerObject != nullptr)
+    {
+        void* localPlayer = g_getPlayerObject(0);
+        void* health = localPlayer != nullptr ? FindBehaviourByName(localPlayer, "PrototypeHealthBehaviour") : nullptr;
+        if (health != nullptr)
+        {
+            float maxHealth = *(float*)((char*)health + 0x14);
+            if (maxHealth > 0.0f)
+                reinterpret_cast<void (__thiscall*)(void*, float)>(At<void*>(0x008480D0))(
+                    health, maxHealth * g_testHealth * 0.01f);
+        }
     }
     if (g_debugIntention && (g_updateCalls % 15) == 0)
     {
