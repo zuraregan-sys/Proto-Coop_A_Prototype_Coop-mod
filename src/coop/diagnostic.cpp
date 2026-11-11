@@ -1059,13 +1059,12 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
     static unsigned int setupIndex = 0;
     unsigned char* setup = setups[setupIndex++ % 32];
     reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x00820080))(setup);
-    memcpy(setup, data + 10, 0xA0);
-    // The store drawable is process-local (it was copied from the sender), so
-    // make the effect from the archetype instead of an invalid store.
-    *(unsigned char*)(setup + 0x70) = 0;
-    *(unsigned int*)(setup + 0x98) = 0xFFFFFFFF;
+    // Take only the placement from the sender (transform + part name); every
+    // other field keeps the local defaults, so no sender-local handle leaks in.
+    memcpy(setup, data + 10, 0x40);
+    memcpy(setup + 0x40, data + 10 + 0x40, 8);
     // World effects keep their own target; attached ones follow the puppet.
-    if (ReadU32(setup, 0x48) != 0xFFFF)
+    if (ReadU32(data + 10, 0x48) != 0xFFFF)
         memcpy(setup + 0x48, &g_puppetHandle, 4);
     unsigned char out[4] = { 0, 0, 0, 0 };
     unsigned int nameCopy[2];
