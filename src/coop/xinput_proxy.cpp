@@ -62,6 +62,7 @@ namespace
     DWORD g_start = 0;
     DWORD g_packet = 0;
     bool g_movesForward = true;
+    bool g_isClient = false;
 
     using GetStateFn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
     using SetStateFn = DWORD (WINAPI*)(DWORD, XINPUT_VIBRATION*);
@@ -241,6 +242,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         char selfPath[MAX_PATH];
         if (GetModuleFileNameA(module, selfPath, MAX_PATH) != 0)
             g_movesForward = strstr(selfPath, "TestInstances\\1\\") == nullptr;
+            g_isClient = !g_movesForward;
         InitLog(module);
         Log("xinput proxy attached");
         LoadReal();

@@ -1093,6 +1093,30 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
         Log("effect recv #%u archetype=%p drawable=%08X", g_effectRecvCount, archetype, *(const unsigned int*)out);
 }
 
+static void __cdecl InvalidParameterHandler(const wchar_t* expression, const wchar_t* function,
+    const wchar_t* file, unsigned int line, uintptr_t reserved)
+{
+    Log("crt: invalid parameter in %ls line %u", function != nullptr ? function : L"?", line);
+}
+
+// The engine aborts the process when a replicated effect makes it resolve
+// something that does not exist locally (an unknown joint, for example). A
+// handler of our own turns that abort into a logged no-op.
+static void InstallCrtHandler()
+{
+    HMODULE crt = GetModuleHandleA("MSVCR80.dll");
+    if (crt == nullptr) crt = GetModuleHandleA("msvcr80.dll");
+    if (crt == nullptr) return;
+    using SetHandlerFn = void* (__cdecl*)(void*);
+    SetHandlerFn setHandler = reinterpret_cast<SetHandlerFn>(
+        GetProcAddress(crt, "_set_invalid_parameter_handler"));
+    if (setHandler != nullptr)
+    {
+        setHandler(reinterpret_cast<void*>(&InvalidParameterHandler));
+        Log("crt: invalid parameter handler installed");
+    }
+}
+
 static bool __attribute__((force_align_arg_pointer)) __thiscall HookActionStart(void* self, int arg, float value)
 {
     unsigned int target = ReadU32(self, 0x40);
@@ -1614,6 +1638,7 @@ static void InstallHooks()
         return;
     }
 
+    InstallCrtHandler();
     Install("ChannelManager::Open", At<void*>(0x008C31D0), (void*)&HookOpen, (void**)&g_open);
     Install("ChannelManager::Close", At<void*>(0x008C3670), (void*)&HookClose, (void**)&g_close);
     Install("Channel::Send", At<void*>(0x008C3F90), (void*)&HookSend, (void**)&g_send);
