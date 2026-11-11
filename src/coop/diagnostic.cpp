@@ -248,7 +248,7 @@ static void SendPlayerTransform()
     memcpy(packet + 2, &sx, 2);
     memcpy(packet + 4, &sy, 2);
     memcpy(packet + 6, &sz, 2);
-    Log("transform host %.2f %.2f %.2f -> %d %d %d", x, y, z, sx, sy, sz);
+    Log("transform send(%s) %.2f %.2f %.2f -> %d %d %d", g_isHost ? "host" : "client", x, y, z, sx, sy, sz);
     HookSend(&g_fakeChannel, 0, 1, packet, sizeof(packet), 1);
 }
 
@@ -608,7 +608,7 @@ static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
 {
     if (!g_started && g_updateCalls > 300)
         StartFakeSession();
-    if (g_started && g_isHost && (g_updateCalls % 60) == 0)
+    if (g_started && (g_updateCalls % 60) == 0)
     {
         SendHeartbeat();
         SendPlayerTransform();
@@ -620,7 +620,7 @@ static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
         Log("players p0=%p p1=%p handles=%08X/%08X", player0, player1,
             *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E40C),
             *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410));
-        if (!g_isHost && player0 != nullptr && !g_puppetSpawned)
+        if (player0 != nullptr && !g_puppetSpawned)
         {
             if (!g_attrDumped)
             {
@@ -710,7 +710,7 @@ static void* __attribute__((force_align_arg_pointer)) __cdecl HookApplySync(cons
         memcpy(&sx, bytes + 2, 2);
         memcpy(&sy, bytes + 4, 2);
         memcpy(&sz, bytes + 6, 2);
-        Log("transform client %.2f %.2f %.2f", sx / 8.0f, sy / 8.0f, sz / 8.0f);
+        Log("transform recv(%s) %.2f %.2f %.2f", g_isHost ? "host" : "client", sx / 8.0f, sy / 8.0f, sz / 8.0f);
         g_remoteX = sx / 8.0f;
         g_remoteY = sy / 8.0f;
         g_remoteZ = sz / 8.0f;
