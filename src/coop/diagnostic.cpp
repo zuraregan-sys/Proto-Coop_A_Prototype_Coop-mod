@@ -51,9 +51,6 @@ static bool g_transportReady = false;
 static void* g_controllerUpdate = nullptr;
 static DWORD g_lastTick = 0;
 static unsigned int g_recvCount = 0;
-static unsigned int g_poseCount = 0;
-static unsigned int g_poseSendCount = 0;
-static unsigned int g_poseMismatch = 0;
 static void FrameTick();
 static sockaddr_in g_peer;
 static unsigned short g_localPort = 27016;
@@ -507,10 +504,6 @@ static const char* const g_harmfulBehaviours[] =
 {
     "PhysicsBehaviour",
     "TouchBehaviour",
-    "PuppetBehaviour",
-    "MotionTreeBehaviour",
-    "MotionStateBehaviour",
-    "CharacterMotionBehaviour",
     "CollisionAction",
     "HitReaction",
     "FightVariables",
@@ -638,34 +631,6 @@ static void DumpIntention(void* object, const char* tag)
             *(const int*)(buttons + 24), *(const float*)(buttons + 28),
             *(const int*)(buttons + 36), *(const float*)(buttons + 40));
     }
-}
-
-static unsigned int GetAttributeValue(void* object, unsigned int vtable);
-
-// Reports the pose behind a character's Pose* attribute (joint count and the
-// joint transform arrays) so the two poses can be compared.
-static void DumpPose(void* object, const char* tag)
-{
-    unsigned int pose = GetAttributeValue(object, 0x10E80688);
-    if (!Plausible(reinterpret_cast<void*>(pose)))
-    {
-        Log("pose(%s): none", tag);
-        return;
-    }
-    unsigned int joints = ReadU32(reinterpret_cast<void*>(pose), 8);
-    Log("pose(%s): pose=%p joints=%u rotations=%08X translations=%08X flags=%02X", tag,
-        reinterpret_cast<void*>(pose), joints, ReadU32(reinterpret_cast<void*>(pose), 0xC),
-        ReadU32(reinterpret_cast<void*>(pose), 0x10), ReadU32(reinterpret_cast<void*>(pose), 0x30));
-    for (unsigned int i = 0; i < 32; i += 8)
-        Log("pose(%s): +%02X %08X %08X %08X %08X %08X %08X %08X %08X", tag, i * 4,
-            ReadU32(reinterpret_cast<void*>(pose), i * 4 + 0x00),
-            ReadU32(reinterpret_cast<void*>(pose), i * 4 + 0x04),
-            ReadU32(reinterpret_cast<void*>(pose), i * 4 + 0x08),
-            ReadU32(reinterpret_cast<void*>(pose), i * 4 + 0x0C),
-            ReadU32(reinterpret_cast<void*>(pose), i * 4 + 0x10),
-            ReadU32(reinterpret_cast<void*>(pose), i * 4 + 0x14),
-            ReadU32(reinterpret_cast<void*>(pose), i * 4 + 0x18),
-            ReadU32(reinterpret_cast<void*>(pose), i * 4 + 0x1C));
 }
 
 // Pokes the character's intention axes: used to find which axis drives the
@@ -839,8 +804,6 @@ static void SpawnPuppet()
             reinterpret_cast<void*>(GetAttributeValue(playerObject, 0x10D9653C)));
     }
     void* player1 = g_getPlayerObject ? g_getPlayerObject(1) : nullptr;
-    DumpPose(object, "puppet");
-    DumpPose(playerObject, "player");
     Log("spawn: index=%u gen=%u handle=%08X p1=%p at %.1f %.1f %.1f", objectIndex, generation, handle,
         player1, position[0], position[1], position[2]);
     g_puppetSpawned = true;
@@ -935,70 +898,8 @@ static void StartFakeSession()
     g_startSync(&g_fakeOwner, 0x2000, 100);
 }
 
-// Streams the local player's joint transforms (quaternion + translation per
-// joint) so the remote avatar animates exactly like its owner.
-static void SendPose()
-{
-    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
-    if (player == nullptr || g_socket == INVALID_SOCKET) return;
-    unsigned int pose = GetAttributeValue(player, 0x10E80688);
-    if (!Plausible(reinterpret_cast<void*>(pose))) return;
-    unsigned int joints = ReadU32(reinterpret_cast<void*>(pose), 0x14);
-    unsigned int rotations = ReadU32(reinterpret_cast<void*>(pose), 0x18);
-    unsigned int translations = ReadU32(reinterpret_cast<void*>(pose), 0x1C);
-    if (joints == 0 || joints > 128 || !Plausible(reinterpret_cast<void*>(rotations)) ||
-        !Plausible(reinterpret_cast<void*>(translations)))
-        return;
-    static unsigned char buffer[8 + 128 * 32];
-    buffer[0] = 'A';
-    buffer[1] = '1';
-    memcpy(buffer + 2, &joints, 2);
-    if ((g_poseSendCount++ % 120) == 0)
-        Log("pose send: %u joints", joints);
-    for (unsigned int i = 0; i < joints; ++i)
-    {
-        memcpy(buffer + 4 + i * 32, reinterpret_cast<void*>(rotations + i * 16), 16);
-        memcpy(buffer + 4 + i * 32 + 16, reinterpret_cast<void*>(translations + i * 16), 16);
-    }
-    sendto(g_socket, (const char*)buffer, 4 + (int)joints * 32, 0, (sockaddr*)&g_peer, sizeof(g_peer));
-}
-
-static void ApplyPose(const unsigned char* data, int length)
-{
-    if (length < 4 || g_puppetObject == nullptr) return;
-    unsigned short joints = 0;
-    memcpy(&joints, data + 2, 2);
-    if (joints == 0 || joints > 128 || length < 4 + (int)joints * 32) return;
-    unsigned int pose = GetAttributeValue(g_puppetObject, 0x10E80688);
-    if (!Plausible(reinterpret_cast<void*>(pose))) return;
-    if (ReadU32(reinterpret_cast<void*>(pose), 0x14) != joints)
-    {
-        if ((g_poseMismatch++ % 120) == 0)
-            Log("pose mismatch: sent %u, puppet %u", joints, ReadU32(reinterpret_cast<void*>(pose), 0x14));
-        return;
-    }
-    unsigned int rotations = ReadU32(reinterpret_cast<void*>(pose), 0x18);
-    unsigned int translations = ReadU32(reinterpret_cast<void*>(pose), 0x1C);
-    if (!Plausible(reinterpret_cast<void*>(rotations)) || !Plausible(reinterpret_cast<void*>(translations)))
-        return;
-    for (unsigned int i = 0; i < joints; ++i)
-    {
-        memcpy(reinterpret_cast<void*>(rotations + i * 16), data + 4 + i * 32, 16);
-        memcpy(reinterpret_cast<void*>(translations + i * 16), data + 4 + i * 32 + 16, 16);
-    }
-    using UpdateFn = void (__thiscall*)(void*);
-    reinterpret_cast<UpdateFn>(At<void*>(0x006DD6E0))(reinterpret_cast<void*>(pose));
-    if ((g_poseCount++ % 60) == 0)
-        Log("pose recv: %u joints", joints);
-}
-
 static void HandlePacket(const unsigned char* data, int length)
 {
-    if (length >= 4 && data[0] == 'A' && data[1] == '1')
-    {
-        ApplyPose(data, length);
-        return;
-    }
     if (length >= 8 && memcmp(data, "P1", 2) == 0)
     {
         short sx = 0, sy = 0, sz = 0;
@@ -1023,7 +924,7 @@ static void PollSocket()
     if (g_socket == INVALID_SOCKET) return;
     for (int i = 0; i < 16; ++i)
     {
-        unsigned char buffer[8192];
+        unsigned char buffer[64];
         sockaddr_in from = {};
         int fromSize = sizeof(from);
         int received = recvfrom(g_socket, (char*)buffer, sizeof(buffer), 0, (sockaddr*)&from, &fromSize);
@@ -1070,9 +971,6 @@ static void FrameTick()
         // ~20 Hz keeps the remote avatar close to its real position.
         if ((g_updateCalls % 3) == 0)
             SendPlayerTransform();
-        // Pose on the frames between the position ones, also ~20 Hz.
-        if ((g_updateCalls % 3) == 1)
-            SendPose();
     }
     if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
     {
