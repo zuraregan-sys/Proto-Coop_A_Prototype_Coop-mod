@@ -166,13 +166,6 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
         state->Gamepad.sThumbRY = 0;
         if (buttons != 0)
             Log("scripted buttons=%04X at %lu ms", buttons, elapsed);
-        // Only one instance walks, so the other one can watch the puppet follow.
-        if (g_movesForward && elapsed >= 100000 && elapsed < 107000)
-        {
-            state->Gamepad.sThumbLY = 20000;
-            if ((elapsed % 1000) < 20)
-                Log("scripted walk at %lu ms", elapsed);
-        }
         return ERROR_SUCCESS;
     }
     return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
