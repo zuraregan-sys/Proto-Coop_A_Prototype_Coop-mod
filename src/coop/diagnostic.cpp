@@ -266,6 +266,34 @@ static bool g_poseEnterLogged = false;
 
 // Streams the local player's joint transforms (quaternion + translation per
 // joint) so the remote avatar can be drawn with its owner's animation.
+static float g_remoteBasis[12];
+static bool g_remoteBasisValid = false;
+
+// Sends the player's 3x3 basis (with padding) so the remote avatar turns the
+// same way the player does; the pose alone does not carry the object rotation.
+static void SendRotation()
+{
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if (player == nullptr || g_socket == INVALID_SOCKET) return;
+    const float* matrix = ReadInlineMatrix(player);
+    if (matrix == nullptr) return;
+    unsigned char packet[4 + 12 * 4];
+    packet[0] = 'R';
+    packet[1] = '1';
+    packet[2] = 0;
+    packet[3] = 0;
+    memcpy(packet + 4, matrix, 12 * 4);
+    sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+}
+
+static void StoreRotation(const unsigned char* data, int length)
+{
+    if (length < 4 + 12 * 4) return;
+    memcpy(g_remoteBasis, data + 4, sizeof(g_remoteBasis));
+    if (!g_remoteBasisValid) Log("rotation stored");
+    g_remoteBasisValid = true;
+}
+
 static void SendPose()
 {
     void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
@@ -1014,6 +1042,11 @@ static void StartFakeSession()
 
 static void HandlePacket(const unsigned char* data, int length)
 {
+    if (length >= 4 && data[0] == 'R' && data[1] == '1')
+    {
+        StoreRotation(data, length);
+        return;
+    }
     if (length >= 4 && data[0] == 'A' && data[1] == '1')
     {
         StorePose(data, length);
@@ -1093,6 +1126,8 @@ static void FrameTick()
         // 30 Hz pose stream; the receiver smooths it to the frame rate.
         if ((g_updateCalls % 2) == 0)
             SendPose();
+        if ((g_updateCalls % 3) == 2)
+            SendRotation();
     }
     if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
     {
@@ -1233,7 +1268,25 @@ static void FrameTick()
             Log("follow: puppet %.2f %.2f %.2f target %.2f %.2f %.2f", g_puppetX, g_puppetY, g_puppetZ, x, y, z);
         if (g_intentTest != 0.0f)
             PokeIntention(g_puppetObject, g_intentTest);
-        SetObjectPosition(g_puppetObject, g_puppetX, g_puppetY, g_puppetZ);
+        if (g_remoteBasisValid)
+        {
+            float* matrix = const_cast<float*>(ReadInlineMatrix(g_puppetObject));
+            if (matrix != nullptr)
+            {
+                memcpy(matrix, g_remoteBasis, sizeof(g_remoteBasis));
+                matrix[12] = g_puppetX;
+                matrix[13] = g_puppetY;
+                matrix[14] = g_puppetZ;
+            }
+            else
+            {
+                SetObjectPosition(g_puppetObject, g_puppetX, g_puppetY, g_puppetZ);
+            }
+        }
+        else
+        {
+            SetObjectPosition(g_puppetObject, g_puppetX, g_puppetY, g_puppetZ);
+        }
     }
 }
 
