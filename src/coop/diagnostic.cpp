@@ -78,6 +78,7 @@ static bool g_dumpHealth = false;
 static bool g_dumpTransform = false;
 static bool g_transformDumped = false;
 static void* g_sendMessage = nullptr;
+static void* g_copyTemplate = nullptr;
 static unsigned int g_puppetHideUntil = 0;
 static bool g_puppetRenderEnabled = true;
 static bool g_puppetTransformEnabled = true;
@@ -2222,6 +2223,19 @@ static bool __attribute__((force_align_arg_pointer)) __thiscall HookSendMessage(
     return reinterpret_cast<bool (__thiscall*)(void*, void*)>(g_sendMessage)(self, message);
 }
 
+static void __attribute__((force_align_arg_pointer)) __thiscall HookCopyTemplate(void* self, void* destination)
+{
+    if (destination == nullptr)
+    {
+        // The whip/transform setup sometimes calls this copy with a missing
+        // destination object and then writes through it (0x1061A41B). Drop the
+        // copy instead of taking the process down.
+        Log("copy: null destination self=%p vtable=%08X", self, self != nullptr ? ReadU32(self, 0) : 0);
+        return;
+    }
+    reinterpret_cast<void (__thiscall*)(void*, void*)>(g_copyTemplate)(self, destination);
+}
+
 static bool Install(const char* name, void* target, void* detour, void** original)
 {
     MH_STATUS status = MH_CreateHook(target, detour, original);
@@ -2304,6 +2318,7 @@ static void InstallHooks()
     Install("ControllerSystem::Update", At<void*>(0x00643A20), (void*)&HookControllerUpdate, (void**)&g_controllerUpdate);
     Install("RenderBehaviour::Update", At<void*>(0x008627B0), (void*)&HookRenderUpdate, (void**)&g_renderUpdate);
     Install("GameObject::SendMessage", At<void*>(0x007E0810), (void*)&HookSendMessage, (void**)&g_sendMessage);
+    Install("TransformCopy", At<void*>(0x0061A410), (void*)&HookCopyTemplate, (void**)&g_copyTemplate);
     Install("EffectManager::StartEffect", At<void*>(0x0081E6B0), (void*)&HookStartEffect, (void**)&g_startEffect);
     Install("EffectAction::Slot5", At<void*>(0x008076B0), (void*)&HookActionStart, (void**)&g_actionStart);
     g_drawableArchetypeCaster = reinterpret_cast<void*>(0x10D97DC4);
