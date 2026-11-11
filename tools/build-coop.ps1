@@ -12,7 +12,7 @@ New-Item -ItemType Directory -Force -Path $Build | Out-Null
 
 $Clang = Join-Path $Llvm "i686-w64-mingw32-clang.exe"
 $ClangPP = Join-Path $Llvm "i686-w64-mingw32-clang++.exe"
-$Common = @("--target=i686-w64-mingw32", "-O2", "-fno-exceptions", "-fno-rtti", "-D_WIN32_WINNT=0x0601", "-D_WIN32_LEAN_AND_MEAN")
+$Common = @("--target=i686-w64-mingw32", "-O2", "-fno-exceptions", "-fno-rtti", "-mstackrealign", "-D_WIN32_WINNT=0x0601", "-D_WIN32_LEAN_AND_MEAN")
 $Includes = @("-I$MinHook\include", "-I$MinHook\src", "-I$MinHook\src\hde")
 
 $MinHookSources = @(

@@ -1,4 +1,4 @@
-﻿#define WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -118,7 +118,7 @@ static bool g_attrDumped = false;
 static void* g_puppetObject = nullptr;static bool g_remoteValid = false;
 static float g_remoteX = 0.0f, g_remoteY = 0.0f, g_remoteZ = 0.0f;
 
-static void __thiscall HookSend(void* self, int target, int type, const void* data, unsigned int length, int flag);
+static void __attribute__((force_align_arg_pointer)) __thiscall HookSend(void* self, int target, int type, const void* data, unsigned int length, int flag);
 
 static void ReadConfig()
 {
@@ -195,15 +195,20 @@ static void SendHeartbeat()
         Log("heartbeat send failed: %d", WSAGetLastError());
 }
 
+static void* ReadObjectMatrix(void* object)
+{
+    if (object == nullptr) return nullptr;
+    void* transformAttribute = *(void**)(reinterpret_cast<unsigned char*>(object) + 0x1c);
+    if (transformAttribute == nullptr) return nullptr;
+    void** vtable = *(void***)transformAttribute;
+    if (vtable == nullptr || vtable[1] == nullptr) return nullptr;
+    using GetMatrixFn = void* (__thiscall*)(void*);
+    return reinterpret_cast<GetMatrixFn>(vtable[1])(transformAttribute);
+}
+
 static bool ReadObjectPosition(void* player, float* x, float* y, float* z)
 {
-    if (player == nullptr) return false;
-    void* transformAttribute = *(void**)(reinterpret_cast<unsigned char*>(player) + 0x1c);
-    if (transformAttribute == nullptr) return false;
-    void** vtable = *(void***)transformAttribute;
-    if (vtable == nullptr || vtable[1] == nullptr) return false;
-    using GetMatrixFn = void* (__thiscall*)(void*);
-    void* matrix = reinterpret_cast<GetMatrixFn>(vtable[1])(transformAttribute);
+    void* matrix = ReadObjectMatrix(player);
     if (matrix == nullptr) return false;
     *x = *(float*)(reinterpret_cast<unsigned char*>(matrix) + 0x30);
     *y = *(float*)(reinterpret_cast<unsigned char*>(matrix) + 0x34);
@@ -511,7 +516,7 @@ static void SpawnPuppet()
 }
 
 
-static void* __thiscall HookOpen(void* self, unsigned char kind, unsigned int a, unsigned int b)
+static void* __attribute__((force_align_arg_pointer)) __thiscall HookOpen(void* self, unsigned char kind, unsigned int a, unsigned int b)
 {
     if (self == &g_fakeChannelManager)
     {
@@ -522,7 +527,7 @@ static void* __thiscall HookOpen(void* self, unsigned char kind, unsigned int a,
     return g_open(self, kind, a, b);
 }
 
-static void __thiscall HookClose(void* self, void* channel)
+static void __attribute__((force_align_arg_pointer)) __thiscall HookClose(void* self, void* channel)
 {
     if (self == &g_fakeChannelManager || channel == &g_fakeChannel)
     {
@@ -533,7 +538,7 @@ static void __thiscall HookClose(void* self, void* channel)
     g_close(self, channel);
 }
 
-static void __thiscall HookSend(void* self, int target, int type, const void* data, unsigned int length, int flag)
+static void __attribute__((force_align_arg_pointer)) __thiscall HookSend(void* self, int target, int type, const void* data, unsigned int length, int flag)
 {
     if (self == &g_fakeChannel)
     {
@@ -551,7 +556,7 @@ static void __thiscall HookSend(void* self, int target, int type, const void* da
     g_send(self, target, type, data, length, flag);
 }
 
-static const char* __thiscall HookReceive(void* self, char* buffer, int capacity, unsigned int* length, unsigned char* flag, int** source)
+static const char* __attribute__((force_align_arg_pointer)) __thiscall HookReceive(void* self, char* buffer, int capacity, unsigned int* length, unsigned char* flag, int** source)
 {
     if (self == &g_fakeChannel)
     {
@@ -576,7 +581,7 @@ static const char* __thiscall HookReceive(void* self, char* buffer, int capacity
     return result;
 }
 
-static void __cdecl HookStartSync(void* owner, int a, int b)
+static void __attribute__((force_align_arg_pointer)) __cdecl HookStartSync(void* owner, int a, int b)
 {
     Log("StartSync owner=%p a=%d b=%d", owner, a, b);
     g_startSync(owner, a, b);
@@ -599,7 +604,7 @@ static void StartFakeSession()
     g_startSync(&g_fakeOwner, 0x2000, 100);
 }
 
-static void __cdecl HookUpdateSync()
+static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
 {
     if (!g_started && g_updateCalls > 300)
         StartFakeSession();
@@ -657,11 +662,12 @@ static void __cdecl HookUpdateSync()
         SpawnPuppet();
     if (g_puppetObject != nullptr)
     {
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        bool playerOk = ReadPlayerPosition(&px, &py, &pz);
         float x = g_remoteX, y = g_remoteY, z = g_remoteZ;
         if (g_puppetLocal != 0 || !g_remoteValid)
         {
-            float px = 0.0f, py = 0.0f, pz = 0.0f;
-            if (ReadPlayerPosition(&px, &py, &pz))
+            if (playerOk)
             {
                 x = px;
                 y = py;
@@ -672,11 +678,25 @@ static void __cdecl HookUpdateSync()
                     x += 1.5f;
             }
         }
+        // When the puppet would stand inside the local player (both clients load
+        // the same save), move it a step to the side so it stands on the roof
+        // instead of over the drop.
+        if (playerOk)
+        {
+            float dx = x - px;
+            float dz = z - pz;
+            if (dx * dx + dz * dz < 1.0f)
+            {
+                x = px - 1.5f;
+                z = pz - 1.5f;
+                y = py;
+            }
+        }
         SetObjectPosition(g_puppetObject, x, y, z);
     }
 }
 
-static void* __cdecl HookApplySync(const unsigned int* machines, int type, const void* message)
+static void* __attribute__((force_align_arg_pointer)) __cdecl HookApplySync(const unsigned int* machines, int type, const void* message)
 {
     if (message != nullptr && memcmp(message, "PCOP", 4) == 0)
     {
@@ -725,7 +745,7 @@ static void* g_sampledTemplate = nullptr;
 using CreateSpawnedFn = void* (__cdecl*)(void*, const void*, int, void*, void*, bool);
 static CreateSpawnedFn g_createSpawned = nullptr;
 
-static void* __cdecl HookCreateSpawned(void* tmpl, const void* name, int heap, void* inventory, void* target, bool flag)
+static void* __attribute__((force_align_arg_pointer)) __cdecl HookCreateSpawned(void* tmpl, const void* name, int heap, void* inventory, void* target, bool flag)
 {
     void* object = g_createSpawned(tmpl, name, heap, inventory, target, flag);
     long index = InterlockedIncrement(&g_spawnCount) - 1;
