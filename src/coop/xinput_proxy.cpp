@@ -128,22 +128,16 @@ namespace
 
     WORD ButtonsAt(DWORD elapsedMs)
     {
-        // Times are from process start; tuned for the 2025 Steam build.
-        // Start -> A through the warning -> A at the main menu -> Down to CONTINUE -> A, A.
-        if (elapsedMs >= 32000 && elapsedMs < 32120) return 0x0010; // START
-        if (elapsedMs >= 38000 && elapsedMs < 38120) return 0x1000; // A
-        if (elapsedMs >= 41000 && elapsedMs < 41120) return 0x1000; // A
-        if (elapsedMs >= 48000 && elapsedMs < 48120) return 0x0002; // DPAD DOWN
-        if (elapsedMs >= 50000 && elapsedMs < 50120) return 0x1000; // A (CONTINUE)
-        if (elapsedMs >= 56000 && elapsedMs < 56120) return 0x1000; // A (load)
-        if (elapsedMs >= 62000 && elapsedMs < 62120) return 0x1000; // A (confirm)
-        if (elapsedMs >= 70000 && elapsedMs < 70120) return 0x1000; // A (if a prompt remains)
-        if (elapsedMs >= 78000 && elapsedMs < 78120) return 0x1000;
-        // Dismiss the "free roam" info panel the mission shows after loading.
-        if (elapsedMs >= 86000 && elapsedMs < 86120) return 0x1000;
-        if (elapsedMs >= 96000 && elapsedMs < 96120) return 0x1000;
-        if (elapsedMs >= 106000 && elapsedMs < 106120) return 0x1000;
-        if (elapsedMs >= 116000 && elapsedMs < 116120) return 0x1000;
+        // Fast boot: args.txt skips the movies, legal screen and the loading
+        // prompt, so the front end reaches the save list in a few seconds.
+        if (elapsedMs >= 6000 && elapsedMs < 6120) return 0x0010;  // START
+        if (elapsedMs >= 8000 && elapsedMs < 8120) return 0x1000;  // A (notice)
+        if (elapsedMs >= 10000 && elapsedMs < 10120) return 0x1000; // A (notice)
+        if (elapsedMs >= 12000 && elapsedMs < 12120) return 0x0002; // DPAD DOWN (CONTINUE)
+        if (elapsedMs >= 14000 && elapsedMs < 14120) return 0x1000; // A (save list)
+        if (elapsedMs >= 16000 && elapsedMs < 16120) return 0x1000; // A (load)
+        if (elapsedMs >= 18000 && elapsedMs < 18120) return 0x1000; // A (confirm)
+        if (elapsedMs >= 21000 && elapsedMs < 21120) return 0x1000; // A (info panel)
         return 0;
     }
 }
@@ -153,10 +147,9 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
     if (user == 0 && state != nullptr)
     {
         DWORD elapsed = GetTickCount() - g_start;
-        // The scripted menu only needs the first two minutes; after the last
-        // panel prompt the real device is forwarded so the player keeps full
-        // keyboard/pad control.
-        if (elapsed >= 118000)
+        // The scripted menu covers the fast boot; afterwards the real device is
+        // forwarded so the player keeps full keyboard/pad control.
+        if (elapsed >= 36000)
             return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
         WORD buttons = ButtonsAt(elapsed);
         memset(state, 0, sizeof(*state));

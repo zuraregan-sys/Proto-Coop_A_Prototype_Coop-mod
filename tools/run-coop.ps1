@@ -11,6 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $Dirs = @((Join-Path $Root "TestInstances\0"), (Join-Path $Root "TestInstances\1"))
+$FastOptions = @("windowed", "SkipMovies", "NoMovie", "NoFELoadingPrompt", "NoAutoSave", "NoSleepOnLostFocus")
 
 Add-Type @"
 using System;
@@ -27,8 +28,11 @@ for ($i = 0; $i -lt $Dirs.Count; $i++)
 {
     $exe = Join-Path $Dirs[$i] "prototypef.exe"
     if (-not (Test-Path $exe)) { throw "missing $exe" }
+    # The engine reads these from args.txt at start: no intro movies or legal
+    # screen, no "press a key" after loading, no autosave and no sleep on focus.
+    Set-Content -Path (Join-Path $Dirs[$i] "args.txt") -Value ($FastOptions -join "`n") -Encoding ASCII
     $Processes += Start-Process -FilePath $exe -WorkingDirectory $Dirs[$i] `
-        -ArgumentList @("windowed", "NoSleepOnLostFocus") -PassThru
+        -ArgumentList $FastOptions -PassThru
 }
 
 if ($NoPosition) { return }
