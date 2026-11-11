@@ -152,6 +152,10 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
     if (user == 0 && state != nullptr)
     {
         DWORD elapsed = GetTickCount() - g_start;
+        // The scripted menu only needs the first two minutes; after that the real
+        // device is forwarded so the player keeps full keyboard/pad control.
+        if (elapsed >= 130000)
+            return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
         WORD buttons = ButtonsAt(elapsed);
         memset(state, 0, sizeof(*state));
         state->dwPacketNumber = ++g_packet;
@@ -163,7 +167,7 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
         if (buttons != 0)
             Log("scripted buttons=%04X at %lu ms", buttons, elapsed);
         // Only one instance walks, so the other one can watch the puppet follow.
-        if (g_movesForward && elapsed >= 130000 && elapsed < 137000)
+        if (g_movesForward && elapsed >= 100000 && elapsed < 107000)
         {
             state->Gamepad.sThumbLY = 20000;
             if ((elapsed % 1000) < 20)

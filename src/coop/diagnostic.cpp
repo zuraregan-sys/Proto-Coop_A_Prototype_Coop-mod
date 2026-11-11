@@ -47,6 +47,11 @@ static FakeSyncOwner g_fakeOwner;
 static int g_peerMask = 2;
 
 static SOCKET g_socket = INVALID_SOCKET;
+static bool g_transportReady = false;
+static void* g_controllerUpdate = nullptr;
+static DWORD g_lastTick = 0;
+static unsigned int g_recvCount = 0;
+static void FrameTick();
 static sockaddr_in g_peer;
 static unsigned short g_localPort = 27016;
 static unsigned short g_peerPort = 27017;
@@ -59,6 +64,7 @@ static int g_testWalk = 0;
 static int g_testWalkLeft = 0;
 static int g_puppetLog = 0;
 static bool g_followLog = false;
+static bool g_fakeSession = false;
 static bool g_puppetStatic = false;
 static unsigned int g_heartbeat = 0;
 
@@ -147,6 +153,7 @@ static void ReadConfig()
     g_puppetLocal = GetPrivateProfileIntA("coop", "puppet_local", 0, path);
     g_testWalk = GetPrivateProfileIntA("coop", "test_walk", 0, path);
     g_followLog = GetPrivateProfileIntA("coop", "follow_log", 0, path) != 0;
+    g_fakeSession = GetPrivateProfileIntA("coop", "fake_session", 0, path) != 0;
     g_puppetStatic = GetPrivateProfileIntA("coop", "puppet_static", 0, path) != 0;
     Log("config role=%s local=%u peer=%u mask=%d offset_y=%.0f", g_isHost ? "host" : "client", g_localPort,
         g_peerPort, g_peerMask, g_testOffsetY);
@@ -189,18 +196,9 @@ static void SendHeartbeat()
     unsigned char packet[8] = { 'P', 'C', 'O', 'P', 0, 0, 0, 0 };
     ++g_heartbeat;
     memcpy(packet + 4, &g_heartbeat, sizeof(g_heartbeat));
-    void* netSystem = nullptr;
-    if (g_engine != nullptr)
-        netSystem = *(void**)(reinterpret_cast<unsigned char*>(g_engine) + 0x13187D4);
-    if (g_sendSyncMessage != nullptr && netSystem != nullptr)
-    {
-        g_sendSyncMessage(0, packet);
-        Log("heartbeat via SendSyncMessage %u", g_heartbeat);
-        return;
-    }
     int sent = sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
     if (sent == sizeof(packet))
-        Log("heartbeat direct %u", g_heartbeat);
+        Log("heartbeat %u", g_heartbeat);
     else
         Log("heartbeat send failed: %d", WSAGetLastError());
 }
@@ -269,7 +267,7 @@ static void SendPlayerTransform()
     memcpy(packet + 4, &sy, 2);
     memcpy(packet + 6, &sz, 2);
     Log("transform send(%s) %.2f %.2f %.2f -> %d %d %d", g_isHost ? "host" : "client", x, y, z, sx, sy, sz);
-    HookSend(&g_fakeChannel, 0, 1, packet, sizeof(packet), 1);
+    sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
 }
 
 static const char* NameText(const void* name)
@@ -814,11 +812,73 @@ static void StartFakeSession()
     g_startSync(&g_fakeOwner, 0x2000, 100);
 }
 
+static void HandlePacket(const unsigned char* data, int length)
+{
+    if (length >= 8 && memcmp(data, "P1", 2) == 0)
+    {
+        short sx = 0, sy = 0, sz = 0;
+        memcpy(&sx, data + 2, 2);
+        memcpy(&sy, data + 4, 2);
+        memcpy(&sz, data + 6, 2);
+        g_remoteX = sx / 8.0f;
+        g_remoteY = sy / 8.0f;
+        g_remoteZ = sz / 8.0f;
+        g_remoteValid = true;
+        if ((g_recvCount++ % 10) == 0)
+            Log("transform recv(%s) %.2f %.2f %.2f", g_isHost ? "host" : "client", g_remoteX, g_remoteY, g_remoteZ);
+    }
+    else if (length >= 4 && memcmp(data, "PCOP", 4) == 0)
+    {
+        Log("heartbeat received");
+    }
+}
+
+static void PollSocket()
+{
+    if (g_socket == INVALID_SOCKET) return;
+    for (int i = 0; i < 16; ++i)
+    {
+        unsigned char buffer[64];
+        sockaddr_in from = {};
+        int fromSize = sizeof(from);
+        int received = recvfrom(g_socket, (char*)buffer, sizeof(buffer), 0, (sockaddr*)&from, &fromSize);
+        if (received <= 0) break;
+        HandlePacket(buffer, received);
+    }
+}
+
 static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
 {
-    if (!g_started && g_updateCalls > 300)
-        StartFakeSession();
-    if (g_started)
+    FrameTick();
+    g_updateSync();
+}
+
+static void __attribute__((force_align_arg_pointer)) __thiscall HookControllerUpdate(void* self)
+{
+    FrameTick();
+    reinterpret_cast<void (__thiscall*)(void*)>(g_controllerUpdate)(self);
+}
+
+static void FrameTick()
+{
+    // Both tick sources (engine sync and the controller) may fire in one frame.
+    DWORD now = GetTickCount();
+    if (now == g_lastTick) return;
+    g_lastTick = now;
+
+    PollSocket();
+
+    if (!g_started && !g_transportReady && g_updateCalls > 300)
+    {
+        if (g_fakeSession)
+            StartFakeSession();
+        else
+        {
+            g_transportReady = InitSocket();
+            Log("transport ready=%d", g_transportReady ? 1 : 0);
+        }
+    }
+    if (g_started || g_transportReady)
     {
         if ((g_updateCalls % 60) == 0)
             SendHeartbeat();
@@ -830,9 +890,12 @@ static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
     {
         void* player0 = g_getPlayerObject(0);
         void* player1 = g_getPlayerObject(1);
-        Log("players p0=%p p1=%p handles=%08X/%08X", player0, player1,
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        if (!ReadObjectPosition(player0, &px, &py, &pz))
+            px = py = pz = -1.0f;
+        Log("players p0=%p p1=%p handles=%08X/%08X pos=%.2f %.2f %.2f", player0, player1,
             *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E40C),
-            *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410));
+            *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410), px, py, pz);
         if (player0 != nullptr && !g_puppetSpawned)
         {
             if (!g_attrDumped)
@@ -855,7 +918,8 @@ static void __attribute__((force_align_arg_pointer)) __cdecl HookUpdateSync()
         }
     }
     g_updateCalls++;
-    g_updateSync();
+    if (g_started)
+        g_updateSync();
     if (g_isHost && g_testMove != 0 && !g_testMoved && g_updateCalls > 6000)
     {
         float x = 0.0f, y = 0.0f, z = 0.0f;
@@ -1047,6 +1111,7 @@ static void InstallHooks()
     Install("UpdateSync", At<void*>(0x008336F0), (void*)&HookUpdateSync, (void**)&g_updateSync);
     Install("ApplySyncMessage", At<void*>(0x00833450), (void*)&HookApplySync, (void**)&g_applySync);
     Install("GameObjectSpawner::Create", At<void*>(0x007F25C0), (void*)&HookCreateSpawned, (void**)&g_createSpawned);
+    Install("ControllerSystem::Update", At<void*>(0x00643A20), (void*)&HookControllerUpdate, (void**)&g_controllerUpdate);
     g_sendSyncMessage = At<SendSyncMessageFn>(0x00833790);
     g_getPlayerObject = At<GetPlayerObjectFn>(0x00099560);
     g_findTemplate = At<void*>(0x00374650);
