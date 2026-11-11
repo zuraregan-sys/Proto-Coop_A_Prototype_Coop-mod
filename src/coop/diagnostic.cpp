@@ -1004,6 +1004,40 @@ static void SpawnPuppet()
         Log("render: player=%p drawable=%08X puppet=%p drawable=%08X", playerRender,
             playerRender != nullptr ? ReadU32(playerRender, 0x14) : 0, puppetRender,
             puppetRender != nullptr ? ReadU32(puppetRender, 0x14) : 0);
+        void* playerTransform = FindBehaviourByName(playerObject, "TransformationBehaviour");
+        void* puppetTransform = FindBehaviourByName(object, "TransformationBehaviour");
+        Log("transform slots: player=%08X/%08X/%08X puppet=%08X/%08X/%08X tmpl=%08X/%08X left=%08X/%08X",
+            playerTransform != nullptr ? ReadU32(playerTransform, 0x10) : 0,
+            playerTransform != nullptr ? ReadU32(playerTransform, 0x14) : 0,
+            playerTransform != nullptr ? ReadU32(playerTransform, 0x18) : 0,
+            puppetTransform != nullptr ? ReadU32(puppetTransform, 0x10) : 0,
+            puppetTransform != nullptr ? ReadU32(puppetTransform, 0x14) : 0,
+            puppetTransform != nullptr ? ReadU32(puppetTransform, 0x18) : 0,
+            playerTransform != nullptr ? ReadU32(playerTransform, 0xBC) : 0,
+            puppetTransform != nullptr ? ReadU32(puppetTransform, 0xBC) : 0,
+            playerTransform != nullptr ? ReadU32(playerTransform, 0xD8) : 0,
+            puppetTransform != nullptr ? ReadU32(puppetTransform, 0xD8) : 0);
+        if (playerTransform != nullptr)
+        {
+            void* tmpl = reinterpret_cast<void*>(ReadU32(playerTransform, 0xBC));
+            if (Plausible(tmpl))
+            {
+                const unsigned int* words = reinterpret_cast<const unsigned int*>(tmpl);
+                const char* rtti = RttiName(tmpl);
+                Log("transform tmpl: %p vtable=%08X rtti=%s words=%08X %08X %08X %08X %08X %08X", tmpl,
+                    words[0], rtti != nullptr ? rtti : "(none)", words[1], words[2], words[3], words[4],
+                    words[5], words[6]);
+            }
+            void* left = reinterpret_cast<void*>(ReadU32(playerTransform, 0xD8));
+            if (Plausible(left))
+            {
+                const unsigned int* words = reinterpret_cast<const unsigned int*>(left);
+                const char* rtti = RttiName(left);
+                Log("transform left: %p vtable=%08X rtti=%s words=%08X %08X %08X %08X %08X %08X", left,
+                    words[0], rtti != nullptr ? rtti : "(none)", words[1], words[2], words[3], words[4],
+                    words[5], words[6]);
+            }
+        }
         ClonePuppetDrivers(reinterpret_cast<void*>(GetAttributeValue(object, 0x10D9653C)),
             reinterpret_cast<void*>(GetAttributeValue(playerObject, 0x10D9653C)));
     }
@@ -1468,6 +1502,16 @@ static int ReadTransformSlots(void* object, TransformSlotState* out, int max)
         if (Plausible(reinterpret_cast<void*>(active)) && Plausible(reinterpret_cast<void*>(active + 8)))
             memcpy(out[i].activeDescription, reinterpret_cast<void*>(active + 8), 8);
         out[i].active = *(unsigned int*)(slot + 0x1C) != 0 ? 1 : 0;
+        if (g_dumpTransform && out[i].active)
+        {
+            unsigned int description = *(unsigned int*)(slot + 0x0C);
+            if (Plausible(reinterpret_cast<void*>(description)))
+                Log("transform desc: slot=%08X/%08X drawable=%08X body=%08X left=%08X needed=%d",
+                    out[i].slot[0], out[i].slot[1], ReadU32(reinterpret_cast<void*>(description), 0x18),
+                    ReadU32(reinterpret_cast<void*>(description), 0x20),
+                    ReadU32(reinterpret_cast<void*>(description), 0x30),
+                    static_cast<int>(ReadU32(reinterpret_cast<void*>(description), 0x38)));
+        }
     }
     return count;
 }
@@ -1540,6 +1584,24 @@ static int FindPuppetSlot(void* behaviour, const unsigned int* name)
     return -1;
 }
 
+static unsigned int FindPuppetDescription(void* behaviour, const unsigned int* name)
+{
+    if (name[0] == 0 && name[1] == 0) return 0;
+    unsigned int begin = ReadU32(behaviour, 0x20);
+    unsigned int end = ReadU32(behaviour, 0x24);
+    if (!Plausible(reinterpret_cast<void*>(begin)) || end < begin) return 0;
+    unsigned int count = (end - begin) / 4;
+    if (count > 64) count = 64;
+    for (unsigned int i = 0; i < count; ++i)
+    {
+        unsigned int description = *(unsigned int*)(begin + i * 4);
+        if (!Plausible(reinterpret_cast<void*>(description)) || !Plausible(reinterpret_cast<void*>(description + 8)))
+            continue;
+        if (memcmp(reinterpret_cast<void*>(description + 8), name, 8) == 0) return description;
+    }
+    return 0;
+}
+
 static bool SameTransformSlot(const TransformSlotState& a, const TransformSlotState& b)
 {
     return memcmp(a.slot, b.slot, 8) == 0 && memcmp(a.activeDescription, b.activeDescription, 8) == 0 &&
@@ -1554,6 +1616,14 @@ static bool AppliedStateChanged(const TransformSlotState& state)
     return true;
 }
 
+static bool WasSlotActive(const TransformSlotState& state)
+{
+    for (int i = 0; i < g_lastAppliedSlotCount; ++i)
+        if (memcmp(g_lastAppliedSlots[i].slot, state.slot, 8) == 0)
+            return g_lastAppliedSlots[i].active != 0;
+    return false;
+}
+
 static void ApplyTransformState(const TransformSlotState* state, int count, bool force)
 {
     if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
@@ -1565,9 +1635,36 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
     g_remoteTransformation = 1;
     for (int i = 0; i < count; ++i)
     {
-        if (!state[i].active) continue;
+        if (!state[i].active)
+        {
+            if (!force && WasSlotActive(state[i]))
+            {
+                unsigned int slotName[2];
+                memcpy(slotName, state[i].slot, 8);
+                SendTransformStart(g_puppetObject, slotName, false);
+            }
+            continue;
+        }
         if (FindPuppetSlot(behaviour, state[i].slot) < 0) continue;
         if (!force && !AppliedStateChanged(state[i])) continue;
+        unsigned int description = FindPuppetDescription(behaviour, state[i].activeDescription);
+        if (description == 0)
+        {
+            if (g_dumpTransform)
+                Log("transform state: description not found for slot=%08X/%08X", state[i].slot[0],
+                    state[i].slot[1]);
+            continue;
+        }
+        // Body transformations (armor, muscle mass) add a second body template
+        // on the puppet, which already has its normal body: four arms. Only
+        // arm-level transformations (no bodyTemplate) are safe to start.
+        if (ReadU32(reinterpret_cast<void*>(description), 0x20) != 0)
+        {
+            if (g_dumpTransform)
+                Log("transform state: skip body transformation slot=%08X/%08X", state[i].slot[0],
+                    state[i].slot[1]);
+            continue;
+        }
         unsigned int slotName[2];
         memcpy(slotName, state[i].slot, 8);
         // Only the start is sent: the puppet's slots already carry the same
