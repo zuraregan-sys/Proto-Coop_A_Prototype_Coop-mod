@@ -1073,11 +1073,21 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
     static unsigned int setupIndex = 0;
     unsigned char* setup = setups[setupIndex++ % 32];
     reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x00820080))(setup);
-    // Only world effects: they do not need a part on the puppet (an unknown
-    // part name makes the engine abort while resolving it).
-    if (ReadU32(data + 10, 0x48) != 0xFFFF) return;
+    // Placement from the sender: the transform always, the part name only for
+    // effects attached to the character.
+    unsigned int target = ReadU32(data + 10, 0x48);
     memcpy(setup, data + 10, 0x40);
-    memset(setup + 0x40, 0, 8);
+    if (target == 0xFFFF)
+    {
+        memset(setup + 0x40, 0, 8);
+    }
+    else
+    {
+        // Attached effect: no joint name (the sender's index is process-local);
+        // keep it on the puppet's root instead.
+        memset(setup + 0x40, 0, 8);
+        memcpy(setup + 0x48, &g_puppetHandle, 4);
+    }
     unsigned char out[4] = { 0, 0, 0, 0 };
     unsigned int nameCopy[2];
     memcpy(nameCopy, data + 2, 8);
