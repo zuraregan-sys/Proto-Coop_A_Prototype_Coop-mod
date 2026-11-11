@@ -434,6 +434,129 @@ static void* FindInventoryTemplateByHash(unsigned int hash)
     return nullptr;
 }
 
+// Reads the MSVC RTTI name behind an object's vtable (".?AVClass@Namespace@@"),
+// which is how the puppet's behaviours are identified.
+static const char* RttiName(void* object)
+{
+    if (object == nullptr) return nullptr;
+    unsigned int vtable = *(unsigned int*)object;
+    if (vtable < 0x10D00000 || vtable > 0x11200000) return nullptr;
+    unsigned int locator = *(unsigned int*)(reinterpret_cast<unsigned char*>(vtable) - 4);
+    if (!Plausible(reinterpret_cast<void*>(locator))) return nullptr;
+    unsigned int descriptor = ReadU32(reinterpret_cast<void*>(locator), 0x0C);
+    if (!Plausible(reinterpret_cast<void*>(descriptor))) return nullptr;
+    // The MSVC TypeDescriptor holds the decorated name inline, right after its
+    // vftable and spare word.
+    return reinterpret_cast<const char*>(descriptor + 8);
+}
+
+// Walks the object's behaviour controller (GameObject+0x20) and reports the
+// behaviour classes it holds: the render/animation ones are kept, the fight ones
+// are what let a puppet hurt players.
+static void DumpBehaviours(void* object)
+{
+    if (object == nullptr) return;
+    unsigned char* controller = reinterpret_cast<unsigned char*>(object) + 0x20;
+    for (unsigned int offset = 0; offset <= 0x40; offset += 4)
+    {
+        unsigned int begin = ReadU32(controller, offset);
+        unsigned int end = ReadU32(controller, offset + 4);
+        if (!Plausible(reinterpret_cast<void*>(begin)) || end < begin) continue;
+        unsigned int count = (end - begin) / 4;
+        if (count == 0 || count > 64) continue;
+        bool ownerMatches = true;
+        for (unsigned int i = 0; i < count; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            if (!Plausible(behaviour) ||
+                (ReadU32(behaviour, 0) != reinterpret_cast<unsigned int>(object) &&
+                 ReadU32(behaviour, 4) != reinterpret_cast<unsigned int>(object)))
+            {
+                ownerMatches = false;
+                break;
+            }
+        }
+        if (!ownerMatches) continue;
+        Log("beh: controller offset +0x%X count=%u", offset, count);
+        for (unsigned int i = 0; i < count; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            const char* name = RttiName(behaviour);
+            Log("beh: [%u] %p %s", i, behaviour, name != nullptr ? name : "(no rtti)");
+        }
+        return;
+    }
+    Log("beh: no behaviour list found");
+}
+
+// The behaviours that let a puppet hurt, shove or react to the player. They are
+// switched off so the avatar is only visual, while the animation and render
+// behaviours stay on.
+static const char* const g_harmfulBehaviours[] =
+{
+    "PhysicsBehaviour",
+    "TouchBehaviour",
+    "CollisionAction",
+    "HitReaction",
+    "FightVariables",
+    "ChargeBehaviour",
+    "GrabSelection",
+    "Grabbable",
+    "Targetable",
+    "LockOnTargeting",
+    "ThreatReceiver",
+    "SensesInfo",
+    "PoisonReaction",
+    "PowerWheel",
+    "Tendril",
+    "Transformation",
+    "Disguise",
+};
+
+static void DisableCombatBehaviours(void* object)
+{
+    if (object == nullptr) return;
+    unsigned char* controller = reinterpret_cast<unsigned char*>(object) + 0x20;
+    for (unsigned int offset = 0; offset <= 0x40; offset += 4)
+    {
+        unsigned int begin = ReadU32(controller, offset);
+        unsigned int end = ReadU32(controller, offset + 4);
+        if (!Plausible(reinterpret_cast<void*>(begin)) || end < begin) continue;
+        unsigned int count = (end - begin) / 4;
+        if (count == 0 || count > 64) continue;
+        bool ownerMatches = true;
+        for (unsigned int i = 0; i < count && ownerMatches; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            if (!Plausible(behaviour) ||
+                (ReadU32(behaviour, 0) != reinterpret_cast<unsigned int>(object) &&
+                 ReadU32(behaviour, 4) != reinterpret_cast<unsigned int>(object)))
+                ownerMatches = false;
+        }
+        if (!ownerMatches) continue;
+        using SetEnabledFn = void (__thiscall*)(void*, bool);
+        unsigned int disabled = 0;
+        for (unsigned int i = 0; i < count; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            const char* name = RttiName(behaviour);
+            if (name == nullptr) continue;
+            for (unsigned int k = 0; k < sizeof(g_harmfulBehaviours) / sizeof(g_harmfulBehaviours[0]); ++k)
+            {
+                if (strstr(name, g_harmfulBehaviours[k]) != nullptr)
+                {
+                    reinterpret_cast<SetEnabledFn>(At<void*>(0x007EEB50))(behaviour, false);
+                    ++disabled;
+                    break;
+                }
+            }
+        }
+        Log("beh: disabled %u of %u behaviours", disabled, count);
+        return;
+    }
+    Log("beh: no behaviour list found to disable");
+}
+
 // The template copy gives the puppet the player's own animation objects. Sharing
 // the choreo puppet drives the player's pose a second time, so the puppet gets
 // it cleared: it still draws, but it no longer animates the player.
@@ -456,8 +579,6 @@ static unsigned int GetAttributeValue(void* object, unsigned int vtable)
 }
 
 // The template copy gives the puppet the player's own animation drivers, and a
-// driver belongs to one pose: sharing them makes the player's pose stop
-// updating. Give the puppet copies of its own.
 static void ClonePuppetDrivers(void* puppet, void* source)
 {
     if (puppet == nullptr || source == nullptr) return;
@@ -467,10 +588,11 @@ static void ClonePuppetDrivers(void* puppet, void* source)
         Log("anim: no drivers to clone (count=%u)", count);
         return;
     }
-    using RemoveAllFn = void (__thiscall*)(void*, bool);
     using GetDriverFn = void* (__thiscall*)(const void*, unsigned int);
     using CopyDriverFromFn = void* (__thiscall*)(void*, void*, void*);
-    reinterpret_cast<RemoveAllFn>(At<void*>(0x009470B0))(puppet, true);
+    // Drop the entry list without releasing the drivers: they are the player's
+    // and releasing them here frees objects the player still uses.
+    *(unsigned int*)(reinterpret_cast<unsigned char*>(puppet) + 0x190) = 0;
     for (unsigned int i = 0; i < count; ++i)
     {
         void* driver = reinterpret_cast<GetDriverFn>(At<void*>(0x009475C0))(source, i);
@@ -553,7 +675,17 @@ static void SpawnPuppet()
         g_puppetSpawned = true;
         return;
     }
-    float position[3] = { g_remoteX + 2.0f, g_remoteY, g_remoteZ };
+    // Start on the ground next to the local player: spawning at the origin makes
+    // the puppet fall and its landing blast throws and hurts the player.
+    void* owner = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    float position[3] = { g_remoteX, g_remoteY, g_remoteZ };
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+    if (owner != nullptr && ReadObjectPosition(owner, &px, &py, &pz))
+    {
+        position[0] = px - 1.5f;
+        position[1] = py;
+        position[2] = pz - 1.5f;
+    }
     reinterpret_cast<SetPositionFn>(g_setPosition)(object, position);
     // GameObject::GetHandle returns the handle through a hidden pointer, so build
     // it from the object's slot index and the generation in the master table.
@@ -577,6 +709,7 @@ static void SpawnPuppet()
     }
     else
     {
+        DisableCombatBehaviours(object);
         ClonePuppetDrivers(reinterpret_cast<void*>(GetAttributeValue(object, 0x10D9653C)),
             reinterpret_cast<void*>(GetAttributeValue(playerObject, 0x10D9653C)));
     }
