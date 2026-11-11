@@ -882,8 +882,8 @@ static void FrameTick()
     {
         if ((g_updateCalls % 60) == 0)
             SendHeartbeat();
-        // ~10 Hz so the remote avatar can be interpolated smoothly.
-        if ((g_updateCalls % 6) == 0)
+        // ~20 Hz keeps the remote avatar close to its real position.
+        if ((g_updateCalls % 3) == 0)
             SendPlayerTransform();
     }
     if (g_getPlayerObject != nullptr && (g_updateCalls % 600) == 0)
@@ -1010,9 +1010,9 @@ static void FrameTick()
             }
             else
             {
-                g_puppetX += dx * 0.25f;
-                g_puppetY += dy * 0.25f;
-                g_puppetZ += dz * 0.25f;
+                g_puppetX += dx * 0.35f;
+                g_puppetY += dy * 0.35f;
+                g_puppetZ += dz * 0.35f;
             }
         }
         if (g_followLog && (g_updateCalls % 15) == 0)
