@@ -982,7 +982,71 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookRenderUpdate
 }
 
 static void* g_startEffect = nullptr;
+static void* g_actionStart = nullptr;
+static int g_inPlayerAction = 0;
 static unsigned int g_effectRecvCount = 0;
+
+static void* g_drawableArchetypeCaster = nullptr;
+static void* g_archetypeGetName = nullptr;
+
+// Finds a drawable archetype in the loaded inventories by its name hash, so a
+// replicated effect does not depend on the per-process name registry.
+static void* FindDrawableArchetype(unsigned int hash)
+{
+    static unsigned int cachedHashes[64];
+    static void* cachedArchetypes[64];
+    static int cachedCount = 0;
+    for (int i = 0; i < cachedCount; ++i)
+        if (cachedHashes[i] == hash) return cachedArchetypes[i];
+
+    void* root = ReadPtr(g_engine, 0x1283818);
+    if (!Plausible(root)) return nullptr;
+    unsigned int inventoryVtable = ReadU32(root, 0);
+    void* inventories[160];
+    int inventoryCount = 0;
+    inventories[inventoryCount++] = root;
+    using CastFn = void* (__thiscall*)(void*, void*);
+    CastFn cast = *reinterpret_cast<CastFn*>(g_drawableArchetypeCaster);
+    struct Caster { void* vtable; };
+    Caster caster;
+    caster.vtable = g_drawableArchetypeCaster;
+    using GetNameFn = const void* (__thiscall*)(void*);
+    GetNameFn getName = reinterpret_cast<GetNameFn>(g_archetypeGetName);
+
+    for (int index = 0; index < inventoryCount && index < 160; ++index)
+    {
+        void* table = ReadPtr(inventories[index], 0x0C);
+        if (!Plausible(table)) continue;
+        unsigned int count = ReadU32(table, 0);
+        void** objects = reinterpret_cast<void**>(ReadPtr(table, 0x1C));
+        if (!Plausible(objects) || count > 20000) continue;
+        for (unsigned int i = 0; i < count; ++i)
+        {
+            void* object = objects[i];
+            if (!Plausible(object)) continue;
+            if (ReadU32(object, 0) == inventoryVtable)
+            {
+                bool seen = false;
+                for (int k = 0; k < inventoryCount; ++k)
+                    if (inventories[k] == object) { seen = true; break; }
+                if (!seen && inventoryCount < 160) inventories[inventoryCount++] = object;
+                continue;
+            }
+            void* archetype = cast(&caster, object);
+            if (archetype == nullptr) continue;
+            const void* name = getName(archetype);
+            if (name == nullptr || ReadU32(const_cast<void*>(name), 0) != hash) continue;
+            if (cachedCount < 64)
+            {
+                cachedHashes[cachedCount] = hash;
+                cachedArchetypes[cachedCount] = archetype;
+                ++cachedCount;
+            }
+            return archetype;
+        }
+    }
+    return nullptr;
+}
 
 static void SpawnRemoteEffect(const unsigned char* data, int length)
 {
@@ -999,10 +1063,30 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
     unsigned int nameCopy[2];
     memcpy(nameCopy, data + 2, 8);
     nameCopy[1] = 0; // the registry index is per process; the hash is the same
+    void* archetype = FindDrawableArchetype(ReadU32(data, 2));
+    const void* effectName = nameCopy;
+    if (archetype != nullptr)
+    {
+        // Use the archetype's own (local) name so StartEffect's lookup succeeds.
+        using GetNameFn = const void* (__thiscall*)(void*);
+        const void* localName = reinterpret_cast<GetNameFn>(g_archetypeGetName)(archetype);
+        if (localName != nullptr) effectName = localName;
+    }
     reinterpret_cast<void (__thiscall*)(void*, void*, const void*, void*)>(At<void*>(0x0081E6B0))(
-        manager, out, nameCopy, setup);
+        manager, out, effectName, setup);
     if ((g_effectRecvCount++ % 20) == 0)
-        Log("effect recv #%u drawable=%08X", g_effectRecvCount, *(const unsigned int*)out);
+        Log("effect recv #%u archetype=%p drawable=%08X", g_effectRecvCount, archetype, *(const unsigned int*)out);
+}
+
+static bool __attribute__((force_align_arg_pointer)) __thiscall HookActionStart(void* self, int arg, float value)
+{
+    unsigned int target = ReadU32(self, 0x40);
+    unsigned int playerHandle = g_engine != nullptr ? ReadU32(g_engine, 0x126E40C) : 0xFFFF;
+    int previous = g_inPlayerAction;
+    g_inPlayerAction = (target != 0 && target != 0xFFFF && target == playerHandle) ? 1 : 0;
+    bool result = reinterpret_cast<bool (__thiscall*)(void*, int, float)>(g_actionStart)(self, arg, value);
+    g_inPlayerAction = previous;
+    return result;
 }
 
 static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect(void* self, void* out, const void* name, void* setup)
@@ -1012,24 +1096,12 @@ static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect
     if (!g_transportReady || setup == nullptr || name == nullptr || g_engine == nullptr) return result;
     unsigned int target = ReadU32(setup, 0x48);
     if (g_logEffects)
-        Log("fx: name=%08X target=%08X pos=%.1f %.1f %.1f", ReadU32(name, 0), target,
+        Log("fx: name=%08X target=%08X action=%d pos=%.1f %.1f %.1f", ReadU32(name, 0), target,
+            g_inPlayerAction,
             *(const float*)((const unsigned char*)setup + 0x30), *(const float*)((const unsigned char*)setup + 0x34), *(const float*)((const unsigned char*)setup + 0x38));
-    unsigned int playerHandle = ReadU32(g_engine, 0x126E40C);
-    bool forward = target != 0 && target == playerHandle;
-    if (!forward && target == 0xFFFF)
-    {
-        // World effect: only the ones around the local player matter (power
-        // effects at the caster), not the distant ambient war.
-        float px = 0.0f, py = 0.0f, pz = 0.0f;
-        if (ReadPlayerPosition(&px, &py, &pz))
-        {
-            float dx = *(const float*)((const unsigned char*)setup + 0x30) - px;
-            float dy = *(const float*)((const unsigned char*)setup + 0x34) - py;
-            float dz = *(const float*)((const unsigned char*)setup + 0x38) - pz;
-            if (dx * dx + dy * dy + dz * dz < 400.0f) forward = true;
-        }
-    }
-    if (!forward) return result;
+    // Only effects started by one of the local player's own fight actions.
+    if (g_inPlayerAction == 0) return result;
+    bool forward = true;
     static unsigned int windowStart = 0;
     static unsigned int windowCount = 0;
     unsigned int now = GetTickCount();
@@ -1513,6 +1585,9 @@ static void InstallHooks()
     Install("ControllerSystem::Update", At<void*>(0x00643A20), (void*)&HookControllerUpdate, (void**)&g_controllerUpdate);
     Install("RenderBehaviour::Update", At<void*>(0x008627B0), (void*)&HookRenderUpdate, (void**)&g_renderUpdate);
     Install("EffectManager::StartEffect", At<void*>(0x0081E6B0), (void*)&HookStartEffect, (void**)&g_startEffect);
+    Install("EffectAction::Slot5", At<void*>(0x008076B0), (void*)&HookActionStart, (void**)&g_actionStart);
+    g_drawableArchetypeCaster = reinterpret_cast<void*>(0x10D97DC4);
+    g_archetypeGetName = At<void*>(0x008258B0);
     g_sendSyncMessage = At<SendSyncMessageFn>(0x00833790);
     g_getPlayerObject = At<GetPlayerObjectFn>(0x00099560);
     g_findTemplate = At<void*>(0x00374650);
