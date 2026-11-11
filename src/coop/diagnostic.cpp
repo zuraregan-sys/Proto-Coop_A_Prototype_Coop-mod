@@ -1059,13 +1059,11 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
     static unsigned int setupIndex = 0;
     unsigned char* setup = setups[setupIndex++ % 32];
     reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x00820080))(setup);
-    // Take only the placement from the sender (transform + part name); every
-    // other field keeps the local defaults, so no sender-local handle leaks in.
+    // Only world effects: they do not need a part on the puppet (an unknown
+    // part name makes the engine abort while resolving it).
+    if (ReadU32(data + 10, 0x48) != 0xFFFF) return;
     memcpy(setup, data + 10, 0x40);
-    memcpy(setup + 0x40, data + 10 + 0x40, 8);
-    // World effects keep their own target; attached ones follow the puppet.
-    if (ReadU32(data + 10, 0x48) != 0xFFFF)
-        memcpy(setup + 0x48, &g_puppetHandle, 4);
+    memset(setup + 0x40, 0, 8);
     unsigned char out[4] = { 0, 0, 0, 0 };
     unsigned int nameCopy[2];
     memcpy(nameCopy, data + 2, 8);
@@ -1079,8 +1077,18 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
         const void* localName = reinterpret_cast<GetNameFn>(g_archetypeGetName)(archetype);
         if (localName != nullptr) effectName = localName;
     }
-    reinterpret_cast<void (__thiscall*)(void*, void*, const void*, void*)>(At<void*>(0x0081E6B0))(
-        manager, out, effectName, setup);
+    if (archetype != nullptr)
+    {
+        if (g_logEffects) Log("effect: create %08X start", ReadU32(data, 2));
+        reinterpret_cast<void (__thiscall*)(void*, void*, const void*, void*)>(At<void*>(0x0081E6B0))(
+            manager, out, effectName, setup);
+        if (g_logEffects) Log("effect: create %08X done drawable=%08X", ReadU32(data, 2), *(const unsigned int*)out);
+    }
+    else
+    {
+        reinterpret_cast<void (__thiscall*)(void*, void*, const void*, void*)>(At<void*>(0x0081E6B0))(
+            manager, out, effectName, setup);
+    }
     if ((g_effectRecvCount++ % 20) == 0)
         Log("effect recv #%u archetype=%p drawable=%08X", g_effectRecvCount, archetype, *(const unsigned int*)out);
 }
