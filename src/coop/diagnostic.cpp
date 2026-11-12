@@ -1696,20 +1696,28 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
     void* behaviour = FindBehaviourByName(g_puppetObject, "TransformationBehaviour");
     if (behaviour == nullptr) return;
     g_remoteTransformation = 1;
+    TransformSlotState applied[8];
+    int appliedCount = 0;
     for (int i = 0; i < count; ++i)
     {
+        bool wasAppliedActive = WasSlotActive(state[i]);
         if (!state[i].active)
         {
-            if (!force && WasSlotActive(state[i]))
+            // Only undo a transformation we actually started on the puppet.
+            // Skipped body/left slots were never applied, so a Start here would
+            // add another set of arms (and corrupt the scene).
+            if (wasAppliedActive)
             {
                 unsigned int slotName[2];
                 memcpy(slotName, state[i].slot, 8);
                 SendTransformStart(g_puppetObject, slotName, false);
+                applied[appliedCount] = state[i];
+                applied[appliedCount].active = 0;
+                ++appliedCount;
             }
             continue;
         }
         if (FindPuppetSlot(behaviour, state[i].slot) < 0) continue;
-        if (!force && !AppliedStateChanged(state[i])) continue;
         unsigned int description = FindPuppetDescription(behaviour, state[i].activeDescription);
         if (description == 0)
         {
@@ -1733,16 +1741,20 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
                     state[i].slot[1]);
             continue;
         }
-        unsigned int slotName[2];
-        memcpy(slotName, state[i].slot, 8);
-        // Only the start is sent: the puppet's slots already carry the same
-        // designed descriptions as the player's template. Sending a desired
-        // description rebuilds the pose and crashes SetRestPose.
-        SendTransformStart(g_puppetObject, slotName, false);
+        if (force || AppliedStateChanged(state[i]))
+        {
+            unsigned int slotName[2];
+            memcpy(slotName, state[i].slot, 8);
+            // Only the start is sent: the puppet's slots already carry the same
+            // designed descriptions as the player's template. Sending a desired
+            // description rebuilds the pose and crashes SetRestPose.
+            SendTransformStart(g_puppetObject, slotName, false);
+        }
+        applied[appliedCount++] = state[i];
     }
     g_remoteTransformation = 0;
-    memcpy(g_lastAppliedSlots, state, sizeof(TransformSlotState) * count);
-    g_lastAppliedSlotCount = count;
+    memcpy(g_lastAppliedSlots, applied, sizeof(TransformSlotState) * appliedCount);
+    g_lastAppliedSlotCount = appliedCount;
     if (g_dumpTransform) Log("transform state apply: %d slots", count);
 }
 
