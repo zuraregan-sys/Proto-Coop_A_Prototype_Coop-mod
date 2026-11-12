@@ -54,6 +54,8 @@ static DWORD g_lastTick = 0;
 static unsigned int g_recvCount = 0;
 static void FrameTick();
 static void ReplayRemoteTransformations();
+static void SendMotionTrail(void* track);
+static void SpawnRemoteMotionTrail(const unsigned char* data, int length);
 static volatile long g_tickCount = 0;
 static volatile long g_phase = 0;
 static DWORD WINAPI WatchdogThread(LPVOID);
@@ -79,9 +81,12 @@ static bool g_dumpTransform = false;
 static bool g_transformDumped = false;
 static void* g_sendMessage = nullptr;
 static void* g_copyTemplate = nullptr;
+static void* g_motionTrail = nullptr;
+static volatile long g_remoteMotionTrail = 0;
 static float g_testMass = 0.0f;
 static float g_testHealth = 0.0f;
 static bool g_logEffects = false;
+static bool g_syncAttachedEffects = false;
 static volatile long g_creatingRemoteEffect = 0;
 static volatile long g_remoteTransformation = 0;
 static float g_intentTest = 0.0f;
@@ -185,6 +190,7 @@ static void ReadConfig()
     g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
     g_testHealth = (float)GetPrivateProfileIntA("coop", "test_health", 0, path);
     g_logEffects = GetPrivateProfileIntA("coop", "log_effects", 0, path) != 0;
+    g_syncAttachedEffects = GetPrivateProfileIntA("coop", "sync_attached", 0, path) != 0;
     g_intentTest = (float)GetPrivateProfileIntA("coop", "intent_test", 0, path);
     g_fakeSession = GetPrivateProfileIntA("coop", "fake_session", 0, path) != 0;
     g_puppetStatic = GetPrivateProfileIntA("coop", "puppet_static", 0, path) != 0;
@@ -1192,6 +1198,10 @@ static void SpawnRemoteEffect(const unsigned char* data, int length)
     // Placement from the sender: the transform always, the part name only for
     // effects attached to the character.
     unsigned int target = ReadU32(data + 10, 0x48);
+    // Attached effects (whip tendrils, armour glows) are what duplicate the
+    // arms and crash the observer when the other player equips a transformation.
+    // World effects still come through; enable this only for debugging.
+    if (target != 0xFFFF && !g_syncAttachedEffects) return;
     ++g_effectRecvCount;
     if (g_logEffects)
         Log("effect recv #%u name=%08X target=%08X", g_effectRecvCount, ReadU32(data, 2), target);
@@ -1333,6 +1343,11 @@ static bool __attribute__((force_align_arg_pointer)) __thiscall HookActionStart(
     bool result = reinterpret_cast<bool (__thiscall*)(void*, int, float)>(g_actionStart)(self, arg, value);
     g_inPlayerAction = previous;
     return result;
+}
+
+static bool __attribute__((force_align_arg_pointer)) __thiscall HookMotionTrail(void* self, int arg, float value)
+{
+    return false;
 }
 
 static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect(void* self, void* out, const void* name, void* setup)
@@ -1574,6 +1589,53 @@ static void SendTransformState()
     if (g_dumpTransform) Log("transform state send: %d slots", count);
 }
 
+// Sends the fields of a MotionTrailTrack needed to recreate a whip/trail on
+// the puppet. Layout mirrors effecttrack.h (MotionTrailTrack offsets).
+static void SendMotionTrail(void* track)
+{
+    if (g_socket == INVALID_SOCKET || track == nullptr) return;
+    unsigned char packet[2 + 7 * 4 + 4 + 4 + 8 + 8 + 6 * 8 + 6 * 12 + 12];
+    int offset = 2;
+    packet[0] = 'M';
+    packet[1] = '1';
+    auto putFloat = [&](float value)
+    {
+        memcpy(packet + offset, &value, sizeof(value));
+        offset += 4;
+    };
+    auto putName = [&](const void* name)
+    {
+        memcpy(packet + offset, name, 8);
+        offset += 8;
+    };
+    auto putVector = [&](const void* vector)
+    {
+        memcpy(packet + offset, vector, 12);
+        offset += 12;
+    };
+    putFloat(*(const float*)((const unsigned char*)track + 0xB4)); // generateTime
+    putFloat(*(const float*)((const unsigned char*)track + 0xA4)); // fadeInTime
+    putFloat(*(const float*)((const unsigned char*)track + 0xAC)); // fadeOutTime
+    putFloat(*(const float*)((const unsigned char*)track + 0xB0)); // fadeTime
+    putFloat(*(const float*)((const unsigned char*)track + 0xA8)); // fadeInTrailTime
+    putFloat(*(const float*)((const unsigned char*)track + 0xBC)); // textureTime
+    putFloat(*(const float*)((const unsigned char*)track + 0xB8)); // shrinkTime
+    unsigned int numJoints = ReadU32(track, 0xC8);
+    unsigned int dragged = *(const unsigned char*)((const unsigned char*)track + 0xD1) != 0 ? 1 : 0;
+    memcpy(packet + offset, &numJoints, 4); offset += 4;
+    memcpy(packet + offset, &dragged, 4); offset += 4;
+    putName((const unsigned char*)track + 0x40); // shader
+    putName((const unsigned char*)track + 0x48); // shrinkJoint
+    for (int i = 0; i < 6; ++i)
+    {
+        putName((const unsigned char*)track + 0x10 + i * 8);
+        putVector((const unsigned char*)track + 0x50 + i * 12);
+    }
+    putVector((const unsigned char*)track + 0x98); // shrinkOffset
+    sendto(g_socket, (const char*)packet, offset, 0, (sockaddr*)&g_peer, sizeof(g_peer));
+    if (g_logEffects) Log("motion trail send");
+}
+
 static int FindPuppetSlot(void* behaviour, const unsigned int* name)
 {
     unsigned int begin = ReadU32(behaviour, 0x10);
@@ -1690,6 +1752,74 @@ static void ResetPuppetTransformations()
     // or default description.
 }
 
+static void SpawnRemoteMotionTrail(const unsigned char* data, int length)
+{
+    if (length < 2 + 7 * 4 + 4 + 4 + 8 + 8 + 6 * 8 + 6 * 12 + 12) return;
+    if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
+    void* render = FindBehaviourByName(g_puppetObject, "RenderBehaviour");
+    if (render == nullptr) return;
+    unsigned int drawable = ReadU32(render, 0x14);
+    unsigned int lookup = GetAttributeValue(g_puppetObject, 0x10E80688);
+    if (lookup == 0) return;
+    void* manager = reinterpret_cast<void* (*)()>(At<void*>(0x008193A0))();
+    if (!Plausible(manager)) return;
+
+    int offset = 2;
+    auto getFloat = [&]()
+    {
+        float value;
+        memcpy(&value, data + offset, 4);
+        offset += 4;
+        return value;
+    };
+    auto getName = [&](unsigned char* name)
+    {
+        memcpy(name, data + offset, 8);
+        // Rebuild the name from the 64-bit hash, not from the sender's registry
+        // index (the two processes do not share name tables).
+        reinterpret_cast<void (__thiscall*)(void*, const unsigned __int64*)>(At<void*>(0x0007EE00))(
+            name, (const unsigned __int64*)(data + offset));
+        offset += 8;
+    };
+    auto getVector = [&](float* vector)
+    {
+        memcpy(vector, data + offset, 12);
+        offset += 12;
+    };
+
+    float generateTime = getFloat();
+    float fadeInTime = getFloat();
+    float fadeOutTime = getFloat();
+    float fadeTime = getFloat();
+    float fadeInTrailTime = getFloat();
+    float textureTime = getFloat();
+    float shrinkTime = getFloat();
+    unsigned int numJoints, dragged;
+    memcpy(&numJoints, data + offset, 4); offset += 4;
+    memcpy(&dragged, data + offset, 4); offset += 4;
+
+    unsigned char shader[8], shrinkJoint[8], joints[6][8];
+    getName(shader);
+    getName(shrinkJoint);
+    float offsets[6][3];
+    for (int i = 0; i < 6; ++i)
+    {
+        getName(joints[i]);
+        getVector(offsets[i]);
+    }
+    float shrinkOffset[3];
+    getVector(shrinkOffset);
+
+    g_remoteMotionTrail = 1;
+    reinterpret_cast<void (__thiscall*)(void*, unsigned int, void*, float, float, float,
+        const void*, const void*, const void*, int, const void*, const float*, float, float, float, float, bool)>(
+        At<void*>(0x0081BA90))(manager, drawable, (void*)lookup, generateTime, fadeInTime, fadeOutTime,
+            shader, joints, offsets, (int)numJoints, shrinkJoint, shrinkOffset, shrinkTime, fadeTime,
+            fadeInTrailTime, textureTime, dragged != 0);
+    g_remoteMotionTrail = 0;
+    if (g_logEffects) Log("motion trail recv");
+}
+
 static void HandleTransformState(const unsigned char* data, int length)
 {
     if (length < 3) return;
@@ -1721,6 +1851,11 @@ static void HandlePacket(const unsigned char* data, int length)
     if (length >= 10 && data[0] == 'E' && data[1] == '1')
     {
         SpawnRemoteEffect(data, length);
+        return;
+    }
+    if (length >= 3 && data[0] == 'M' && data[1] == '1')
+    {
+        SpawnRemoteMotionTrail(data, length);
         return;
     }
     if (length >= 3 && data[0] == 'S' && data[1] == '1')
@@ -2270,6 +2405,7 @@ static void InstallHooks()
     Install("TransformCopy", At<void*>(0x0061A410), (void*)&HookCopyTemplate, (void**)&g_copyTemplate);
     Install("EffectManager::StartEffect", At<void*>(0x0081E6B0), (void*)&HookStartEffect, (void**)&g_startEffect);
     Install("EffectAction::Slot5", At<void*>(0x008076B0), (void*)&HookActionStart, (void**)&g_actionStart);
+    // Install("MotionTrailAction::Slot5", At<void*>(0x00805D30), (void*)&HookMotionTrail, (void**)&g_motionTrail);
     g_drawableArchetypeCaster = reinterpret_cast<void*>(0x10D97DC4);
     g_archetypeGetName = At<void*>(0x008258B0);
     g_sendSyncMessage = At<SendSyncMessageFn>(0x00833790);

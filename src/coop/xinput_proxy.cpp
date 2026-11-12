@@ -149,7 +149,7 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
         DWORD elapsed = GetTickCount() - g_start;
         // The scripted menu covers the fast boot; afterwards the real device is
         // forwarded so the player keeps full keyboard/pad control.
-        if (elapsed >= 50000)
+        if (elapsed >= 36000)
             return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
         WORD buttons = ButtonsAt(elapsed);
         memset(state, 0, sizeof(*state));
