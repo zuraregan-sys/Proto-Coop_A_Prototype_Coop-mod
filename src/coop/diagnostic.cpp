@@ -1718,14 +1718,15 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
                     state[i].slot[1]);
             continue;
         }
-        // Body (`bodyTemplate`) and left-arm (`overrideLeftArmTemplate`)
-        // transformations add a second set of parts to the cloned puppet,
-        // which already has its normal body: four arms / two pairs of hands.
-        // Only right-arm transformations (both zero, e.g. blade/claw) are safe
-        // until the normal parts can be hidden.
+        // Body (`bodyTemplate`), left-arm (`overrideLeftArmTemplate`) and
+        // `leftArmNeeded == 0` transformations add a second set of parts to the
+        // cloned puppet, which already has its normal body: four arms / two
+        // pairs of hands and a corrupted scene drawable list. Only right-arm
+        // transformations that still need the normal left arm are safe.
         unsigned int bodyTemplate = ReadU32(reinterpret_cast<void*>(description), 0x20);
         unsigned int leftTemplate = ReadU32(reinterpret_cast<void*>(description), 0x30);
-        if (bodyTemplate != 0 || leftTemplate != 0)
+        unsigned int leftArmNeeded = ReadU32(reinterpret_cast<void*>(description), 0x38);
+        if (bodyTemplate != 0 || leftTemplate != 0 || leftArmNeeded == 0)
         {
             if (g_dumpTransform)
                 Log("transform state: skip body/left transformation slot=%08X/%08X", state[i].slot[0],
