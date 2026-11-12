@@ -1522,11 +1522,13 @@ static int ReadTransformSlots(void* object, TransformSlotState* out, int max)
         {
             unsigned int description = *(unsigned int*)(slot + 0x0C);
             if (Plausible(reinterpret_cast<void*>(description)))
-                Log("transform desc: slot=%08X/%08X drawable=%08X body=%08X left=%08X needed=%d",
+                Log("transform desc: slot=%08X/%08X drawable=%08X body=%08X left=%08X needed=%d power=%d hud=%d",
                     out[i].slot[0], out[i].slot[1], ReadU32(reinterpret_cast<void*>(description), 0x18),
                     ReadU32(reinterpret_cast<void*>(description), 0x20),
                     ReadU32(reinterpret_cast<void*>(description), 0x30),
-                    static_cast<int>(ReadU32(reinterpret_cast<void*>(description), 0x38)));
+                    static_cast<int>(ReadU32(reinterpret_cast<void*>(description), 0x38)),
+                    static_cast<int>(ReadU32(reinterpret_cast<void*>(description), 0x48)),
+                    static_cast<int>(ReadU32(reinterpret_cast<void*>(description), 0x64)));
         }
     }
     return count;
@@ -1734,11 +1736,16 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
         unsigned int bodyTemplate = ReadU32(reinterpret_cast<void*>(description), 0x20);
         unsigned int leftTemplate = ReadU32(reinterpret_cast<void*>(description), 0x30);
         unsigned int leftArmNeeded = ReadU32(reinterpret_cast<void*>(description), 0x38);
-        if (bodyTemplate != 0 || leftTemplate != 0 || leftArmNeeded == 0)
+        unsigned int hudPower = ReadU32(reinterpret_cast<void*>(description), 0x64);
+        // Whitelist only Claws (1) and Blades (2); WhipFist (4), Armour (6),
+        // Shield (8), MuscleMass (5) and the rest rebuild the puppet's pose or
+        // add a second set of parts. `hudPower` is the HUD power enum at +0x64.
+        if (bodyTemplate != 0 || leftTemplate != 0 || leftArmNeeded == 0 ||
+            (hudPower != 1 && hudPower != 2))
         {
             if (g_dumpTransform)
-                Log("transform state: skip body/left transformation slot=%08X/%08X", state[i].slot[0],
-                    state[i].slot[1]);
+                Log("transform state: skip unsafe transformation slot=%08X/%08X hud=%u body=%08X left=%08X needed=%u",
+                    state[i].slot[0], state[i].slot[1], hudPower, bodyTemplate, leftTemplate, leftArmNeeded);
             continue;
         }
         if (force || AppliedStateChanged(state[i]))
