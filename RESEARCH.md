@@ -28,7 +28,7 @@
 
 ### 1.1 Resultado de las herramientas MCP
 
-**`detect_engine` sobre `D:\SteamLibrary\steamapps\common\Prototype`:**
+**`detect_engine` sobre `<Steam library>\steamapps\common\Prototype`:**
 
 - 124 archivos escaneados.
 - Ejecutables: `prototypef.exe`, `vcredist_x86.exe`, `xdelta3-3.1.0-i686.exe`, `DirectX\DXSETUP.exe`.

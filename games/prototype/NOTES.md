@@ -36,7 +36,7 @@
 
 ## Constraints
 
-- Never modify `D:\SteamLibrary\steamapps\common\Prototype` or the owner's saves.
+- Never modify `<Steam library>\steamapps\common\Prototype` or the owner's saves.
 - Work only in the project copy `Prototype/` and isolated test instances.
 - Never commit game files, assets or binaries.
 - Test with two real clients; bots/scripts before human playtests.

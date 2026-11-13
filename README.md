@@ -18,11 +18,10 @@ Based on the [coop-anything](https://github.com/cranebeaker/coop-anything) resea
 ```text
 Co-op core (transport, avatar, pose)   ████████████████████░░░░  82%
 Powers & transformations               █████████████████░░░░░░░  72%
-Effects (world + attached)             ██████████░░░░░░░░░░░░░░  42%
+Effects (world + attached)             █████░░░░░░░░░░░░░░░░░░░  22%
 Stability / edge cases                 ████████████████░░░░░░░░  64%
-Local co-op / split screen             ░░░░░░░░░░░░░░░░░░░░░░░░   0%
 ──────────────────────────────────────────────────────────────────
-Overall                                █████████████████░░░░░░░  65%
+Overall                                ████████████████░░░░░░░░  60%
 ```
 
 ## Features
@@ -39,11 +38,9 @@ Overall                                █████████████�
 | Powers: Whip Fist | ✅ | arm + pose; the tendril itself is an attached effect (WIP) |
 | Powers: Muscle Mass | ✅ | |
 | Powers: Hammer Fist | ✅ | |
-| World effects | ✅ | Ground spikes, explosions, devastator effects |
-| Attached effects | ⏳ | Whip tendrils, armour glow (disabled: they duplicated the arms) |
+| Effects | ❌ | Neither world effects nor attached effects are replicated yet |
 | Disguise | ⏳ | Separate subsystem (`DisguiseMessage`), not replicated yet |
 | Impact slow motion | ⚙️ | Removed by default to keep the two games in sync (`no_slow_motion=1`) |
-| Local co-op / split screen | ❌ | Planned after online is solid |
 | Steam install untouched | ✅ | The mod runs from copies in `TestInstances\` |
 
 > Powers appear on the remote avatar as soon as the **receiving** game has the power's
@@ -59,8 +56,7 @@ driven by the packets from the other game.
 - **Transport:** UDP, one socket per role (`27016` host / `27017` client). The engine's own
   sync session is not used.
 - **Packets:** `P1` position, `R1` object basis (facing), `A1` 67-joint pose (quaternions +
-  translations), `S1` transformation slots, `M2` character model name, `E1` world effect,
-  `M1` motion trail (whip).
+  translations), `S1` transformation slots, `M2` character model name.
 - **Pose:** read from the player's `Attribute<Pose*>` (`0x10E80688`), sent at 30 Hz,
   nlerp-smoothed on the receiver and pushed into the puppet's pose.
 - **Transformations:** observed from the player's `TransformationBehaviour` slot table
@@ -71,9 +67,6 @@ driven by the packets from the other game.
   streams it, resolves the archetype by hash in the local content inventories and instances
   it on the puppet (`CreateInstance` → `SetDrawable` → reuse of the streamed pose →
   `Drawable::SetPose`).
-- **Effects:** `EffectAction::Slot5` is hooked on the player; only actions that target the
-  local player are forwarded, then the archetype is resolved locally and `StartEffect` is
-  called, so no process-local pointer ever crosses the network.
 
 ### Puppet setup
 
@@ -120,11 +113,11 @@ The repository keeps two prepared copies of the game in `TestInstances\0` and
 ## Roadmap
 
 1. Preload the power models on both sides (no more "equip it once").
-2. Attached effects: whip tendrils, armour glow, motion trails.
+2. Effects: world effects (ground spikes, explosions) and attached effects (whip tendrils,
+   armour glow, motion trails).
 3. Disguise subsystem.
 4. Health / damage / grab interactions between players.
-5. Local co-op (split screen).
-6. Polish: stability, packet rate, desync recovery.
+5. Polish: stability, packet rate, desync recovery.
 
 ## Notes
 
@@ -147,6 +140,6 @@ personaje moverse, luchar, transformarse y usar los poderes — y tú ves el suy
 plugin ASI más un proxy de entrada; **no modifica ni distribuye archivos del juego**.
 
 Estado actual: transporte, avatar remoto, posición/rotación, animación completa de 67
-joints, sincronización del modelo del personaje, los cinco poderes (Claws, Blade, Whip,
-Muscle Mass y Hammer Fist) y los efectos de mundo. Pendiente: precarga de modelos, efectos
-anclados (tentáculos, armadura), disfraz, daño/salud y co-op local.
+joints, sincronización del modelo del personaje y los cinco poderes (Claws, Blade, Whip,
+Muscle Mass y Hammer Fist). Pendiente: precarga de modelos, efectos (de mundo y anclados),
+disfraz y daño/salud.

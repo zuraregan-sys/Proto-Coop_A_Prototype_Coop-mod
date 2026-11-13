@@ -23,3 +23,7 @@
 .env.*
 .vscode/
 .idea/
+
+# Local agent/editor configuration
+opencode.jsonc
+
