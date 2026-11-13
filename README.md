@@ -1,7 +1,7 @@
 # Prototype Co-op — online co-op for Prototype (2009)
 
 Online co-op for **Prototype (2009)** (Steam App ID `10150`): a second player joins your
-city, sees you move, fight, transform and cast your powers — and you see them.
+city, sees you move, transform and cast your powers — and you see them.
 
 The mod is an **ASI plugin + input proxy**. It does **not** modify or ship any game file:
 the Steam installation is never touched, everything runs from the copies in `TestInstances\`.
@@ -18,10 +18,10 @@ Based on the [coop-anything](https://github.com/cranebeaker/coop-anything) resea
 ```text
 Co-op core (transport, avatar, pose)   ████████████████████░░░░  82%
 Powers & transformations               █████████████████░░░░░░░  72%
-Effects (world + attached)             █████░░░░░░░░░░░░░░░░░░░  22%
+Effects (world + attached)             ███░░░░░░░░░░░░░░░░░░░░░  15%
 Stability / edge cases                 ████████████████░░░░░░░░  64%
 ──────────────────────────────────────────────────────────────────
-Overall                                ████████████████░░░░░░░░  60%
+Overall                                ███████████████░░░░░░░░░  58%
 ```
 
 ## Features
