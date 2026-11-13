@@ -116,8 +116,10 @@ The repository keeps two prepared copies of the game in `TestInstances\0` and
 2. Effects: world effects (ground spikes, explosions) and attached effects (whip tendrils,
    armour glow, motion trails are STC, will try to sync them but chances are uncertain).
 3. Disguise subsystem.
-4. Health / damage / grab interactions between players (also STC, feel like this could be annoying, or make it optional).
-5. Polish: stability, packet rate, desync recovery.
+4. Vehicles and weapons.
+5. Story mode.
+6. Health / damage / grab interactions between players (also STC, feel like this could be annoying, or make it optional).
+7. Polish: stability, packet rate, desync recovery.
 
 ## Notes
 
