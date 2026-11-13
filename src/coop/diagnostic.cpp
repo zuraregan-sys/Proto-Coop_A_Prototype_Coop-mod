@@ -1740,10 +1740,12 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
         unsigned int leftTemplate = ReadU32(reinterpret_cast<void*>(description), 0x30);
         unsigned int leftArmNeeded = ReadU32(reinterpret_cast<void*>(description), 0x38);
         unsigned int hudPower = ReadU32(reinterpret_cast<void*>(description), 0x64);
-        // Whitelist only Claws (1). Blades (2) also duplicated the arms on the
-        // cloned puppet; WhipFist (4), Armour (6), Shield (8), MuscleMass (5)
-        // and the rest rebuild the pose or add a second set of parts.
-        if (bodyTemplate != 0 || leftTemplate != 0 || leftArmNeeded == 0 || hudPower != 1)
+        // Whitelist Claws (1) and Blades (2); Blades was re-enabled after the
+        // double-start fix to check whether its duplication was only the forced
+        // replay. WhipFist (4), Armour (6), Shield (8), MuscleMass (5) and the
+        // rest rebuild the pose or add a second set of parts.
+        if (bodyTemplate != 0 || leftTemplate != 0 || leftArmNeeded == 0 ||
+            (hudPower != 1 && hudPower != 2))
         {
             if (g_dumpTransform)
                 Log("transform state: skip unsafe transformation slot=%08X/%08X hud=%u body=%08X left=%08X needed=%u",
