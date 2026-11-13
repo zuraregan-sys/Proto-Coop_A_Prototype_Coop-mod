@@ -141,7 +141,6 @@ Co-op online para **Prototype (2009)**: un segundo jugador entra en tu ciudad y 
 personaje moverse, luchar, transformarse y usar los poderes — y tú ves el suyo. El mod es un
 plugin ASI más un proxy de entrada; **no modifica ni distribuye archivos del juego**.
 
-Estado actual: transporte, avatar remoto, posición/rotación, animación completa de 67
-joints, sincronización del modelo del personaje y los cinco poderes (Claws, Blade, Whip,
-Muscle Mass y Hammer Fist). Pendiente: precarga de modelos, efectos (de mundo y anclados),
+Estado actual: Movimiento, avatar remoto, posición/rotación, animación completa de 67
+joints, sincronización del modelo del personaje y los cinco poderes de ataque (Garras, Cuchilla, Masa muscular, Puño de demolición y Látigo). Pendiente: precarga de modelos, efectos (de mundo y anclados que usan las habilidades y transformaciones),
 disfraz y daño/salud.
