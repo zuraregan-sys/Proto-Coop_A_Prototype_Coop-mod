@@ -87,6 +87,7 @@ static bool g_noSlowMotion = true;
 static void* g_slowRequest = nullptr;
 static bool g_syncModel = true;
 static bool g_dumpAnim = false;
+static bool g_forceSwap = false;
 static bool g_transformStart = false;
 static unsigned char g_localModel[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 static bool g_localModelValid = false;
@@ -202,6 +203,7 @@ static void ReadConfig()
     g_noSlowMotion = GetPrivateProfileIntA("coop", "no_slow_motion", 1, path) != 0;
     g_syncModel = GetPrivateProfileIntA("coop", "sync_model", 1, path) != 0;
     g_dumpAnim = GetPrivateProfileIntA("coop", "dump_anim", 0, path) != 0;
+    g_forceSwap = GetPrivateProfileIntA("coop", "force_swap", 0, path) != 0;
     g_transformStart = GetPrivateProfileIntA("coop", "transform_start", 0, path) != 0;
     g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
     g_testHealth = (float)GetPrivateProfileIntA("coop", "test_health", 0, path);
@@ -1096,7 +1098,11 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookRenderUpdate
     if (!Plausible(reinterpret_cast<void*>(rotations)) || !Plausible(reinterpret_cast<void*>(translations)))
         return;
     // Smooth the 30 Hz stream up to the frame rate: nlerp the quaternions and
-    // lerp the translations of a display copy, then push that to the pose.
+    // lerp the translations of a display copy, then push that to the pose. The
+    // step follows dt, so the motion is the same at any frame rate.
+    float alpha = dt * 20.0f;
+    if (alpha < 0.05f) alpha = 0.05f;
+    if (alpha > 1.0f) alpha = 1.0f;
     for (unsigned int i = 0; i < g_poseJoints; ++i)
     {
         float* shown = reinterpret_cast<float*>(g_poseDisplay + i * 32);
@@ -1104,7 +1110,7 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookRenderUpdate
         float dot = shown[0] * target[0] + shown[1] * target[1] + shown[2] * target[2] + shown[3] * target[3];
         float sign = dot < 0.0f ? -1.0f : 1.0f;
         for (int k = 0; k < 4; ++k)
-            shown[k] += (target[k] * sign - shown[k]) * 0.45f;
+            shown[k] += (target[k] * sign - shown[k]) * alpha;
         float length = sqrtf(shown[0] * shown[0] + shown[1] * shown[1] + shown[2] * shown[2] + shown[3] * shown[3]);
         if (length > 0.0001f)
         {
@@ -1114,7 +1120,7 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookRenderUpdate
             shown[3] /= length;
         }
         for (int k = 4; k < 7; ++k)
-            shown[k] += (target[k] - shown[k]) * 0.45f;
+            shown[k] += (target[k] - shown[k]) * alpha;
         shown[7] = target[7];
     }
     for (unsigned int i = 0; i < g_poseJoints; ++i)
@@ -1366,7 +1372,7 @@ static void ApplyModel()
     unsigned int hash = ReadU32(g_remoteModel, 0);
     // No swap needed when the puppet already wears that model (the two games
     // give the same name different registry indexes, so compare the hash).
-    if (ReadU32(render, 0x18) == hash)
+    if (!g_forceSwap && ReadU32(render, 0x18) == hash)
     {
         memcpy(g_appliedModel, g_remoteModel, 8);
         g_appliedModelValid = true;
@@ -1402,6 +1408,15 @@ static void ApplyModel()
     // render thread).
     unsigned int poseAttribute = ReadU32(render, 0xC);
     unsigned int oldPose = GetAttributeValue(g_puppetObject, 0x10E80688);
+    // Keep the pose the stream has been writing: it already carries the limb
+    // data the skinned body needs. A pose made for the new archetype animates
+    // the arms but leaves the rest of the body frozen.
+    bool reusePose = false;
+    if (Plausible(reinterpret_cast<void*>(oldPose)) && ReadU32(reinterpret_cast<void*>(oldPose), 0x14) == 67)
+    {
+        reusePose = true;
+        reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006E2A70))(reinterpret_cast<void*>(oldPose));
+    }
     // The result is a class with constructors: the address of the result is the
     // hidden first argument.
     using CreateInstanceFn = void (__cdecl*)(void*, void*, unsigned char, unsigned char);
@@ -1417,10 +1432,14 @@ static void ApplyModel()
     // it must be made the same way RenderBehaviour makes it at spawn: from the
     // archetype's pure3d drawable. A pose from the render-side handle has other
     // spaces, and the streamed joints then only drive part of the body.
-    void* pose = reinterpret_cast<void* (__thiscall*)(void*)>(At<void*>(0x00825960))(archetype);
-    if (pose == nullptr && poseAttribute != 0)
-        pose = reinterpret_cast<void* (__thiscall*)(const void*)>(At<void*>(0x007E8820))(
-            reinterpret_cast<const void*>(&handle));
+    void* pose = reusePose ? reinterpret_cast<void*>(oldPose) : nullptr;
+    if (pose == nullptr)
+    {
+        pose = reinterpret_cast<void* (__thiscall*)(void*)>(At<void*>(0x00825960))(archetype);
+        if (pose == nullptr && poseAttribute != 0)
+            pose = reinterpret_cast<void* (__thiscall*)(const void*)>(At<void*>(0x007E8820))(
+                reinterpret_cast<const void*>(&handle));
+    }
     if (pose != nullptr)
     {
         reinterpret_cast<void (__thiscall*)(void*, void*)>(At<void*>(0x00862600))(render, pose);
@@ -1430,11 +1449,13 @@ static void ApplyModel()
         reinterpret_cast<void (__thiscall*)(const void*, void*)>(At<void*>(0x007EDA80))(
             reinterpret_cast<const void*>(&handle), pose);
     }
+    if (reusePose)
+        reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006E2A80))(reinterpret_cast<void*>(oldPose));
     memcpy(g_appliedModel, g_remoteModel, 8);
     g_appliedModelValid = true;
     unsigned int poseNow = GetAttributeValue(g_puppetObject, 0x10E80688);
-    Log("model apply: %08X%08X archetype=%08X pose=%08X/%08X spaces=%02X/%02X joints=%u",
-        ReadU32(g_remoteModel, 4), hash, (unsigned int)archetype, oldPose, poseNow,
+    Log("model apply: %08X%08X archetype=%08X pose=%08X/%08X reuse=%d spaces=%02X/%02X joints=%u",
+        ReadU32(g_remoteModel, 4), hash, (unsigned int)archetype, oldPose, poseNow, reusePose ? 1 : 0,
         oldPose != 0 ? ReadU32(reinterpret_cast<void*>(oldPose), 0x3C) & 0xFF : 0,
         poseNow != 0 ? ReadU32(reinterpret_cast<void*>(poseNow), 0x3C) & 0xFF : 0,
         poseNow != 0 ? ReadU32(reinterpret_cast<void*>(poseNow), 0x14) : 0);
