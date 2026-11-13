@@ -1364,6 +1364,14 @@ static void ApplyModel()
     void* render = FindBehaviourByName(g_puppetObject, "RenderBehaviour");
     if (render == nullptr) return;
     unsigned int hash = ReadU32(g_remoteModel, 0);
+    // No swap needed when the puppet already wears that model (the two games
+    // give the same name different registry indexes, so compare the hash).
+    if (ReadU32(render, 0x18) == hash)
+    {
+        memcpy(g_appliedModel, g_remoteModel, 8);
+        g_appliedModelValid = true;
+        return;
+    }
     void* archetype = ModelArchetype(hash);
     if (archetype == nullptr)
     {
@@ -1414,7 +1422,14 @@ static void ApplyModel()
         pose = reinterpret_cast<void* (__thiscall*)(const void*)>(At<void*>(0x007E8820))(
             reinterpret_cast<const void*>(&handle));
     if (pose != nullptr)
+    {
         reinterpret_cast<void (__thiscall*)(void*, void*)>(At<void*>(0x00862600))(render, pose);
+        // The render behaviour only publishes the pose attribute. Tell the new
+        // drawable to use that same pose object too, so the joints that the
+        // stream writes every frame are the ones the renderer reads.
+        reinterpret_cast<void (__thiscall*)(const void*, void*)>(At<void*>(0x007EDA80))(
+            reinterpret_cast<const void*>(&handle), pose);
+    }
     memcpy(g_appliedModel, g_remoteModel, 8);
     g_appliedModelValid = true;
     unsigned int poseNow = GetAttributeValue(g_puppetObject, 0x10E80688);
