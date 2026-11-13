@@ -83,6 +83,8 @@ static void* g_sendMessage = nullptr;
 static void* g_copyTemplate = nullptr;
 static void* g_motionTrail = nullptr;
 static volatile long g_remoteMotionTrail = 0;
+static bool g_noSlowMotion = true;
+static void* g_slowRequest = nullptr;
 static float g_testMass = 0.0f;
 static float g_testHealth = 0.0f;
 static bool g_logEffects = false;
@@ -187,6 +189,7 @@ static void ReadConfig()
     g_logSpawns = GetPrivateProfileIntA("coop", "log_spawns", 0, path) != 0;
     g_dumpHealth = GetPrivateProfileIntA("coop", "dump_health", 0, path) != 0;
     g_dumpTransform = GetPrivateProfileIntA("coop", "dump_transform", 0, path) != 0;
+    g_noSlowMotion = GetPrivateProfileIntA("coop", "no_slow_motion", 1, path) != 0;
     g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
     g_testHealth = (float)GetPrivateProfileIntA("coop", "test_health", 0, path);
     g_logEffects = GetPrivateProfileIntA("coop", "log_effects", 0, path) != 0;
@@ -1737,18 +1740,17 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
         unsigned int leftTemplate = ReadU32(reinterpret_cast<void*>(description), 0x30);
         unsigned int leftArmNeeded = ReadU32(reinterpret_cast<void*>(description), 0x38);
         unsigned int hudPower = ReadU32(reinterpret_cast<void*>(description), 0x64);
-        // Whitelist only Claws (1) and Blades (2); WhipFist (4), Armour (6),
-        // Shield (8), MuscleMass (5) and the rest rebuild the puppet's pose or
-        // add a second set of parts. `hudPower` is the HUD power enum at +0x64.
-        if (bodyTemplate != 0 || leftTemplate != 0 || leftArmNeeded == 0 ||
-            (hudPower != 1 && hudPower != 2))
+        // Whitelist only Claws (1). Blades (2) also duplicated the arms on the
+        // cloned puppet; WhipFist (4), Armour (6), Shield (8), MuscleMass (5)
+        // and the rest rebuild the pose or add a second set of parts.
+        if (bodyTemplate != 0 || leftTemplate != 0 || leftArmNeeded == 0 || hudPower != 1)
         {
             if (g_dumpTransform)
                 Log("transform state: skip unsafe transformation slot=%08X/%08X hud=%u body=%08X left=%08X needed=%u",
                     state[i].slot[0], state[i].slot[1], hudPower, bodyTemplate, leftTemplate, leftArmNeeded);
             continue;
         }
-        if (force || AppliedStateChanged(state[i]))
+        if (AppliedStateChanged(state[i]))
         {
             unsigned int slotName[2];
             memcpy(slotName, state[i].slot, 8);
@@ -1950,6 +1952,7 @@ static void ResetCoopState()
     g_playerTemplate = nullptr;
     g_poseValid = false;
     g_remoteBasisValid = false;
+    g_lastAppliedSlotCount = 0;
     g_attrDumped = false;
     g_puppetPlaced = false;
     // Keep the spawn records: the new player object was already recorded by the
@@ -2017,6 +2020,7 @@ static void FrameTick()
             g_spawnPending = false;
             g_poseValid = false;
             g_remoteBasisValid = false;
+            g_lastAppliedSlotCount = 0;
             *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = 0xFFFF;
         }
     }
@@ -2340,6 +2344,15 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookCopyTemplate
     reinterpret_cast<void (__thiscall*)(void*, void*)>(g_copyTemplate)(self, destination);
 }
 
+static int __attribute__((force_align_arg_pointer)) __thiscall HookSlowRequest(void* self, void* request)
+{
+    // The first float of SlowMotionRequest is the simulation rate. Forcing it
+    // to 1 removes the impact slow motion while keeping the request alive.
+    if (request != nullptr)
+        *(float*)request = 1.0f;
+    return reinterpret_cast<int (__thiscall*)(void*, void*)>(g_slowRequest)(self, request);
+}
+
 static bool Install(const char* name, void* target, void* detour, void** original)
 {
     MH_STATUS status = MH_CreateHook(target, detour, original);
@@ -2423,6 +2436,8 @@ static void InstallHooks()
     Install("RenderBehaviour::Update", At<void*>(0x008627B0), (void*)&HookRenderUpdate, (void**)&g_renderUpdate);
     Install("GameObject::SendMessage", At<void*>(0x007E0810), (void*)&HookSendMessage, (void**)&g_sendMessage);
     Install("TransformCopy", At<void*>(0x0061A410), (void*)&HookCopyTemplate, (void**)&g_copyTemplate);
+    if (g_noSlowMotion)
+        Install("SlowMotionManager::Request", At<void*>(0x002A68E0), (void*)&HookSlowRequest, (void**)&g_slowRequest);
     Install("EffectManager::StartEffect", At<void*>(0x0081E6B0), (void*)&HookStartEffect, (void**)&g_startEffect);
     Install("EffectAction::Slot5", At<void*>(0x008076B0), (void*)&HookActionStart, (void**)&g_actionStart);
     // Install("MotionTrailAction::Slot5", At<void*>(0x00805D30), (void*)&HookMotionTrail, (void**)&g_motionTrail);
