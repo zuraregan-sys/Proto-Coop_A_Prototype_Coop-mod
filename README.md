@@ -47,7 +47,7 @@ Overall                                █████████████�
 > model loaded (it loads the first time that player equips that power). Preloading the
 > models is the next milestone.
 
-## How it works
+## How it works right now ( for testing)
 
 Two instances of the game run side by side, each with the plugin. Each instance keeps a
 local **puppet**: a copy of the player template spawned into the same map, whose pose is
@@ -112,11 +112,11 @@ The repository keeps two prepared copies of the game in `TestInstances\0` and
 
 ## Roadmap
 
-1. Preload the power models on both sides (no more "equip it once").
+1. Preload the power models on both sides (currently both players need to equip the same power for it to load and be visible in each others character).
 2. Effects: world effects (ground spikes, explosions) and attached effects (whip tendrils,
-   armour glow, motion trails).
+   armour glow, motion trails are STC, will try to sync them but chances are uncertain).
 3. Disguise subsystem.
-4. Health / damage / grab interactions between players.
+4. Health / damage / grab interactions between players (also STC, feel like this could be annoying, or make it optional).
 5. Polish: stability, packet rate, desync recovery.
 
 ## Notes
