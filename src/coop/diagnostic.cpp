@@ -199,8 +199,7 @@ static void ReadConfig()
     g_dumpHealth = GetPrivateProfileIntA("coop", "dump_health", 0, path) != 0;
     g_dumpTransform = GetPrivateProfileIntA("coop", "dump_transform", 0, path) != 0;
     g_noSlowMotion = GetPrivateProfileIntA("coop", "no_slow_motion", 1, path) != 0;
-    g_syncModel = GetPrivateProfileIntA("coop", "sync_model", 1, path) != 0;
-    g_transformStart = GetPrivateProfileIntA("coop", "transform_start", 0, path) != 0;
+    g_syncModel = GetPrivateProfileIntA("coop", "sync_model", 1, path) != 0;    g_transformStart = GetPrivateProfileIntA("coop", "transform_start", 0, path) != 0;
     g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
     g_testHealth = (float)GetPrivateProfileIntA("coop", "test_health", 0, path);
     g_logEffects = GetPrivateProfileIntA("coop", "log_effects", 0, path) != 0;
@@ -1359,6 +1358,14 @@ static void ApplyModel()
     if (archetype == nullptr)
     {
         static unsigned int lastMissing = 0;
+        static unsigned int lastRescan = 0;
+        // The model may be loaded later (when this game's own player equips the
+        // same power), so walk the inventories again every few seconds.
+        if (g_modelScanDone && now - lastRescan > 3000)
+        {
+            lastRescan = now;
+            ModelResetScan(hash);
+        }
         if (lastMissing != hash && g_modelScanDone)
         {
             lastMissing = hash;
@@ -1376,6 +1383,7 @@ static void ApplyModel()
     // DrawableArchetype::CreatePoseInstance (that pure3d drawable belongs to the
     // render thread).
     unsigned int poseAttribute = ReadU32(render, 0xC);
+    unsigned int oldPose = GetAttributeValue(g_puppetObject, 0x10E80688);
     // The result is a class with constructors: the address of the result is the
     // hidden first argument.
     using CreateInstanceFn = void (__cdecl*)(void*, void*, unsigned char, unsigned char);
@@ -1387,18 +1395,24 @@ static void ApplyModel()
     const void* localName = reinterpret_cast<const void* (__thiscall*)(void*)>(At<void*>(0x008258B0))(archetype);
     reinterpret_cast<void (__thiscall*)(void*, unsigned int, const void*)>(At<void*>(0x00862C30))(
         render, handle, localName != nullptr ? localName : g_remoteModel);
-    if (poseAttribute != 0)
-    {
-        void* pose = reinterpret_cast<void* (__thiscall*)(const void*)>(At<void*>(0x007E8820))(
+    // Replacing the pose is required (SetDrawable clears the object's pose), and
+    // it must be made the same way RenderBehaviour makes it at spawn: from the
+    // archetype's pure3d drawable. A pose from the render-side handle has other
+    // spaces, and the streamed joints then only drive part of the body.
+    void* pose = reinterpret_cast<void* (__thiscall*)(void*)>(At<void*>(0x00825960))(archetype);
+    if (pose == nullptr && poseAttribute != 0)
+        pose = reinterpret_cast<void* (__thiscall*)(const void*)>(At<void*>(0x007E8820))(
             reinterpret_cast<const void*>(&handle));
-        if (pose != nullptr)
-            reinterpret_cast<void (__thiscall*)(void*, void*)>(At<void*>(0x00862600))(render, pose);
-    }
+    if (pose != nullptr)
+        reinterpret_cast<void (__thiscall*)(void*, void*)>(At<void*>(0x00862600))(render, pose);
     memcpy(g_appliedModel, g_remoteModel, 8);
     g_appliedModelValid = true;
-    unsigned int pose = GetAttributeValue(g_puppetObject, 0x10E80688);
-    Log("model apply: %08X%08X archetype=%08X joints=%u", ReadU32(g_remoteModel, 4), hash,
-        (unsigned int)archetype, pose != 0 ? ReadU32(reinterpret_cast<void*>(pose), 0x14) : 0);
+    unsigned int poseNow = GetAttributeValue(g_puppetObject, 0x10E80688);
+    Log("model apply: %08X%08X archetype=%08X pose=%08X/%08X spaces=%02X/%02X joints=%u",
+        ReadU32(g_remoteModel, 4), hash, (unsigned int)archetype, oldPose, poseNow,
+        oldPose != 0 ? ReadU32(reinterpret_cast<void*>(oldPose), 0x3C) & 0xFF : 0,
+        poseNow != 0 ? ReadU32(reinterpret_cast<void*>(poseNow), 0x3C) & 0xFF : 0,
+        poseNow != 0 ? ReadU32(reinterpret_cast<void*>(poseNow), 0x14) : 0);
 }
 
 static void SpawnRemoteEffect(const unsigned char* data, int length)
