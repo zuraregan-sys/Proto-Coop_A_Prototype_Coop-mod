@@ -85,6 +85,15 @@ static void* g_motionTrail = nullptr;
 static volatile long g_remoteMotionTrail = 0;
 static bool g_noSlowMotion = true;
 static void* g_slowRequest = nullptr;
+static bool g_syncModel = true;
+static bool g_transformStart = false;
+static unsigned char g_localModel[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+static bool g_localModelValid = false;
+static unsigned char g_remoteModel[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+static bool g_remoteModelValid = false;
+static unsigned char g_appliedModel[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+static bool g_appliedModelValid = false;
+static unsigned int g_lastModelSend = 0;
 static float g_testMass = 0.0f;
 static float g_testHealth = 0.0f;
 static bool g_logEffects = false;
@@ -190,6 +199,8 @@ static void ReadConfig()
     g_dumpHealth = GetPrivateProfileIntA("coop", "dump_health", 0, path) != 0;
     g_dumpTransform = GetPrivateProfileIntA("coop", "dump_transform", 0, path) != 0;
     g_noSlowMotion = GetPrivateProfileIntA("coop", "no_slow_motion", 1, path) != 0;
+    g_syncModel = GetPrivateProfileIntA("coop", "sync_model", 1, path) != 0;
+    g_transformStart = GetPrivateProfileIntA("coop", "transform_start", 0, path) != 0;
     g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
     g_testHealth = (float)GetPrivateProfileIntA("coop", "test_health", 0, path);
     g_logEffects = GetPrivateProfileIntA("coop", "log_effects", 0, path) != 0;
@@ -1187,6 +1198,209 @@ static void* FindDrawableArchetype(unsigned int hash)
     return nullptr;
 }
 
+// A full inventory walk is far too slow for one frame (hundreds of thousands of
+// dynamic casts), so the model lookup runs a few thousand objects per tick and
+// answers as soon as it reaches the archetype.
+static void* g_modelInventories[160];
+static int g_modelInventoryCount = 0;
+static unsigned int g_modelScanInventory = 0;
+static unsigned int g_modelScanObject = 0;
+static unsigned int g_modelScanHash = 0;
+static bool g_modelScanDone = false;
+static void* g_modelFound = nullptr;
+
+static void ModelResetScan(unsigned int hash)
+{
+    g_modelScanHash = hash;
+    g_modelScanInventory = 0;
+    g_modelScanObject = 0;
+    g_modelInventoryCount = 0;
+    g_modelScanDone = false;
+    g_modelFound = nullptr;
+}
+
+static void ModelScanStep(int budget)
+{
+    if (g_modelScanDone) return;
+    if (g_modelInventoryCount == 0)
+    {
+        void* root = ReadPtr(g_engine, 0x1283818);
+        if (!Plausible(root)) return;
+        g_modelInventories[g_modelInventoryCount++] = root;
+    }
+    using CastFn = void* (__thiscall*)(void*, void*);
+    CastFn cast = *reinterpret_cast<CastFn*>(g_drawableArchetypeCaster);
+    struct Caster { void* vtable; };
+    Caster caster;
+    caster.vtable = g_drawableArchetypeCaster;
+    using GetNameFn = const void* (__thiscall*)(void*);
+    GetNameFn getName = reinterpret_cast<GetNameFn>(g_archetypeGetName);
+    unsigned int rootVtable = ReadU32(g_modelInventories[0], 0);
+
+    while (g_modelScanInventory < static_cast<unsigned int>(g_modelInventoryCount) && budget > 0)
+    {
+        void* inventory = g_modelInventories[g_modelScanInventory];
+        void* table = ReadPtr(inventory, 0x0C);
+        if (!Plausible(table))
+        {
+            ++g_modelScanInventory;
+            g_modelScanObject = 0;
+            continue;
+        }
+        unsigned int count = ReadU32(table, 0);
+        void** objects = reinterpret_cast<void**>(ReadPtr(table, 0x1C));
+        if (!Plausible(objects) || count > 20000)
+        {
+            ++g_modelScanInventory;
+            g_modelScanObject = 0;
+            continue;
+        }
+        while (g_modelScanObject < count && budget > 0)
+        {
+            void* object = objects[g_modelScanObject++];
+            --budget;
+            if (!Plausible(object)) continue;
+            unsigned int vtable = ReadU32(object, 0);
+            if (vtable == rootVtable)
+            {
+                bool seen = false;
+                for (int k = 0; k < g_modelInventoryCount; ++k)
+                    if (g_modelInventories[k] == object) { seen = true; break; }
+                if (!seen && g_modelInventoryCount < 160)
+                    g_modelInventories[g_modelInventoryCount++] = object;
+                continue;
+            }
+            if (vtable < 0x10D00000 || vtable > 0x11200000) continue;
+            if (!Plausible(reinterpret_cast<void*>(vtable - 4)) ||
+                !Plausible(reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(vtable - 4), 0))))
+                continue;
+            void* archetype = cast(&caster, object);
+            if (archetype == nullptr) continue;
+            const void* name = getName(archetype);
+            if (name == nullptr) continue;
+            if (ReadU32(const_cast<void*>(name), 0) != g_modelScanHash) continue;
+            g_modelFound = archetype;
+            g_modelScanDone = true;
+            return;
+        }
+        if (g_modelScanObject >= count)
+        {
+            ++g_modelScanInventory;
+            g_modelScanObject = 0;
+        }
+    }
+    if (g_modelScanInventory >= static_cast<unsigned int>(g_modelInventoryCount))
+        g_modelScanDone = true;
+}
+
+// The second word of a core::Name is the per-process registry index, so only the
+// hash is comparable between the two games.
+static void* ModelArchetype(unsigned int hash)
+{
+    if (g_modelScanHash != hash) ModelResetScan(hash);
+    if (g_modelFound != nullptr)
+    {
+        if (ReadU32(g_modelFound, 0) == 0x10E6E394) return g_modelFound;
+        ModelResetScan(hash);
+        return nullptr;
+    }
+    if (g_modelScanDone) return nullptr;
+    ModelScanStep(4000);
+    if (g_modelFound != nullptr && ReadU32(g_modelFound, 0) == 0x10E6E394) return g_modelFound;
+    return nullptr;
+}
+
+// The game swaps the character model when a power is equipped: the
+// RenderBehaviour's drawable archetype name changes to the power's model, and
+// the TransformationDescription carries that same name at +0x18. The puppet is
+// a copy of the default character, so it must be given the same model or the
+// power's arm mesh is drawn on top of its normal one (four arms).
+static void SendModel()
+{
+    if (!g_syncModel || g_socket == INVALID_SOCKET) return;
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if (player == nullptr) return;
+    void* render = FindBehaviourByName(player, "RenderBehaviour");
+    if (render == nullptr) return;
+    unsigned char name[8];
+    memcpy(name, reinterpret_cast<unsigned char*>(render) + 0x18, 8);
+    unsigned long long value = 0;
+    memcpy(&value, name, 8);
+    if (g_localModelValid && memcmp(name, g_localModel, 8) == 0) return;
+    unsigned int now = GetTickCount();
+    if (now - g_lastModelSend < 100) return;
+    memcpy(g_localModel, name, 8);
+    g_localModelValid = true;
+    g_lastModelSend = now;
+    unsigned char packet[10];
+    packet[0] = 'M';
+    packet[1] = '2';
+    memcpy(packet + 2, name, 8);
+    sendto(g_socket, reinterpret_cast<const char*>(packet), 10, 0, reinterpret_cast<sockaddr*>(&g_peer),
+        sizeof(g_peer));
+    Log("model send: %08X%08X", (unsigned int)(value >> 32), (unsigned int)value);
+}
+
+static void ApplyModel()
+{
+    if (!g_syncModel || !g_remoteModelValid) return;
+    if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
+    if (g_appliedModelValid && memcmp(g_remoteModel, g_appliedModel, 8) == 0) return;
+    // The model may not be loaded in this game yet (it only loads the archetypes
+    // its own player uses), so retry at a low rate until it appears.
+    static unsigned int lastAttempt = 0;
+    unsigned int now = GetTickCount();
+    if (now - lastAttempt < 100) return;
+    lastAttempt = now;
+    void* render = FindBehaviourByName(g_puppetObject, "RenderBehaviour");
+    if (render == nullptr) return;
+    unsigned int hash = ReadU32(g_remoteModel, 0);
+    void* archetype = ModelArchetype(hash);
+    if (archetype == nullptr)
+    {
+        static unsigned int lastMissing = 0;
+        if (lastMissing != hash && g_modelScanDone)
+        {
+            lastMissing = hash;
+            Log("model: %08X not loaded here", hash);
+        }
+        return;
+    }
+    unsigned int sourceDrawable = ReadU32(archetype, 8);
+    if (ReadU32(archetype, 0) != 0x10E6E394 || !Plausible(reinterpret_cast<void*>(sourceDrawable)) ||
+        !Plausible(reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(sourceDrawable), 0xA4))))
+        return;
+    // Build the drawable the way the engine's drawable message does: instance
+    // the archetype, publish it on the render behaviour and take the pose from
+    // the render-side handle. SetSource instead crashes in
+    // DrawableArchetype::CreatePoseInstance (that pure3d drawable belongs to the
+    // render thread).
+    unsigned int poseAttribute = ReadU32(render, 0xC);
+    // The result is a class with constructors: the address of the result is the
+    // hidden first argument.
+    using CreateInstanceFn = void (__cdecl*)(void*, void*, unsigned char, unsigned char);
+    unsigned char created[16] = { 0 };
+    reinterpret_cast<CreateInstanceFn>(At<void*>(0x007ED5F0))(created, archetype, 1,
+        poseAttribute != 0 ? 1 : 0);
+    unsigned int handle = *(unsigned int*)created;
+    if (handle == 0xFFFFFFFF) return;
+    const void* localName = reinterpret_cast<const void* (__thiscall*)(void*)>(At<void*>(0x008258B0))(archetype);
+    reinterpret_cast<void (__thiscall*)(void*, unsigned int, const void*)>(At<void*>(0x00862C30))(
+        render, handle, localName != nullptr ? localName : g_remoteModel);
+    if (poseAttribute != 0)
+    {
+        void* pose = reinterpret_cast<void* (__thiscall*)(const void*)>(At<void*>(0x007E8820))(
+            reinterpret_cast<const void*>(&handle));
+        if (pose != nullptr)
+            reinterpret_cast<void (__thiscall*)(void*, void*)>(At<void*>(0x00862600))(render, pose);
+    }
+    memcpy(g_appliedModel, g_remoteModel, 8);
+    g_appliedModelValid = true;
+    unsigned int pose = GetAttributeValue(g_puppetObject, 0x10E80688);
+    Log("model apply: %08X%08X archetype=%08X joints=%u", ReadU32(g_remoteModel, 4), hash,
+        (unsigned int)archetype, pose != 0 ? ReadU32(reinterpret_cast<void*>(pose), 0x14) : 0);
+}
+
 static void SpawnRemoteEffect(const unsigned char* data, int length)
 {
     if (length < 10 + 0x40 || g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
@@ -1711,7 +1925,7 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
             // Only undo a transformation we actually started on the puppet.
             // Skipped body/left slots were never applied, so a Start here would
             // add another set of arms (and corrupt the scene).
-            if (wasAppliedActive)
+            if (wasAppliedActive && g_transformStart)
             {
                 unsigned int slotName[2];
                 memcpy(slotName, state[i].slot, 8);
@@ -1752,7 +1966,7 @@ static void ApplyTransformState(const TransformSlotState* state, int count, bool
                     state[i].slot[0], state[i].slot[1], hudPower, bodyTemplate, leftTemplate, leftArmNeeded);
             continue;
         }
-        if (AppliedStateChanged(state[i]))
+        if (AppliedStateChanged(state[i]) && g_transformStart)
         {
             unsigned int slotName[2];
             memcpy(slotName, state[i].slot, 8);
@@ -1882,6 +2096,13 @@ static void HandlePacket(const unsigned char* data, int length)
         SpawnRemoteMotionTrail(data, length);
         return;
     }
+    if (length >= 10 && data[0] == 'M' && data[1] == '2')
+    {
+        memcpy(g_remoteModel, data + 2, 8);
+        g_remoteModelValid = true;
+        Log("model recv: %08X%08X", ReadU32(data + 2, 4), ReadU32(data + 2, 0));
+        return;
+    }
     if (length >= 3 && data[0] == 'S' && data[1] == '1')
     {
         HandleTransformState(data, length);
@@ -1955,6 +2176,8 @@ static void ResetCoopState()
     g_poseValid = false;
     g_remoteBasisValid = false;
     g_lastAppliedSlotCount = 0;
+    g_appliedModelValid = false;
+    ModelResetScan(0);
     g_attrDumped = false;
     g_puppetPlaced = false;
     // Keep the spawn records: the new player object was already recorded by the
@@ -1976,6 +2199,7 @@ static void FrameTick()
     // cached for the old one is stale.
     static void* lastPlayer = nullptr;
     void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    ApplyModel();
     if (localPlayer != nullptr && localPlayer != lastPlayer)
     {
         if (lastPlayer != nullptr)
@@ -2023,6 +2247,7 @@ static void FrameTick()
             g_poseValid = false;
             g_remoteBasisValid = false;
             g_lastAppliedSlotCount = 0;
+            g_appliedModelValid = false;
             *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = 0xFFFF;
         }
     }
@@ -2056,6 +2281,8 @@ static void FrameTick()
         // slots and send it whenever it changes (plus a slow heartbeat).
         if ((g_updateCalls % 6) == 0)
             SendTransformState();
+        if ((g_updateCalls % 6) == 0)
+            SendModel();
         g_phase = 3;
     }
     // The local player's transformation also leaks into the local puppet (they
@@ -2084,7 +2311,7 @@ static void FrameTick()
                 for (int k = 0; k < shownCount; ++k)
                     if (memcmp(shown[k].slot, local[i].slot, 8) == 0)
                         shownActive = shown[k].active != 0;
-                if (shownActive)
+                if (shownActive && g_transformStart)
                 {
                     unsigned int slotName[2];
                     memcpy(slotName, local[i].slot, 8);
