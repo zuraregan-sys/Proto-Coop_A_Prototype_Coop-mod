@@ -86,6 +86,7 @@ static volatile long g_remoteMotionTrail = 0;
 static bool g_noSlowMotion = true;
 static void* g_slowRequest = nullptr;
 static bool g_syncModel = true;
+static bool g_dumpAnim = false;
 static bool g_transformStart = false;
 static unsigned char g_localModel[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
 static bool g_localModelValid = false;
@@ -199,7 +200,9 @@ static void ReadConfig()
     g_dumpHealth = GetPrivateProfileIntA("coop", "dump_health", 0, path) != 0;
     g_dumpTransform = GetPrivateProfileIntA("coop", "dump_transform", 0, path) != 0;
     g_noSlowMotion = GetPrivateProfileIntA("coop", "no_slow_motion", 1, path) != 0;
-    g_syncModel = GetPrivateProfileIntA("coop", "sync_model", 1, path) != 0;    g_transformStart = GetPrivateProfileIntA("coop", "transform_start", 0, path) != 0;
+    g_syncModel = GetPrivateProfileIntA("coop", "sync_model", 1, path) != 0;
+    g_dumpAnim = GetPrivateProfileIntA("coop", "dump_anim", 0, path) != 0;
+    g_transformStart = GetPrivateProfileIntA("coop", "transform_start", 0, path) != 0;
     g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
     g_testHealth = (float)GetPrivateProfileIntA("coop", "test_health", 0, path);
     g_logEffects = GetPrivateProfileIntA("coop", "log_effects", 0, path) != 0;
@@ -631,9 +634,11 @@ static void DumpBehaviours(void* object)
     Log("beh: no behaviour list found");
 }
 
-// The behaviours that let a puppet hurt, shove or react to the player. They are
-// switched off so the avatar is only visual, while the animation and render
-// behaviours stay on.
+// The behaviours that let a puppet hurt, shove or react to the player, plus the
+// ones that drive its pose (the puppet gets every joint from the owner, so a
+// local animation tree would overwrite the legs and torso with its own stance
+// after the stream is applied). They are switched off so the avatar is only
+// visual, while the render behaviour stays on.
 static const char* const g_harmfulBehaviours[] =
 {
     "PhysicsBehaviour",
@@ -651,6 +656,10 @@ static const char* const g_harmfulBehaviours[] =
     "PoisonReaction",
     "PowerWheel",
     "Tendril",
+    "CharacterMotionBehaviour",
+    "MotionTreeBehaviour",
+    "MotionStateBehaviour",
+    "IKBehaviour",
 };
 
 static void DisableCombatBehaviours(void* object)
@@ -681,6 +690,7 @@ static void DisableCombatBehaviours(void* object)
             void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
             const char* name = RttiName(behaviour);
             if (name == nullptr) continue;
+            Log("beh[%u]: %s", i, name);
             for (unsigned int k = 0; k < sizeof(g_harmfulBehaviours) / sizeof(g_harmfulBehaviours[0]); ++k)
             {
                 if (strstr(name, g_harmfulBehaviours[k]) != nullptr)
@@ -2200,6 +2210,30 @@ static void ResetCoopState()
         *(unsigned int*)(reinterpret_cast<unsigned char*>(g_engine) + 0x126E410) = 0xFFFF;
 }
 
+static void DumpAnimChanges(void* object, const char* tag)
+{
+    if (object == nullptr) return;
+    unsigned int pose = GetAttributeValue(object, 0x10E80688);
+    if (!Plausible(reinterpret_cast<void*>(pose))) return;
+    unsigned int joints = ReadU32(reinterpret_cast<void*>(pose), 0x14);
+    unsigned int rotations = ReadU32(reinterpret_cast<void*>(pose), 0x18);
+    if (joints == 0 || joints > 67 || !Plausible(reinterpret_cast<void*>(rotations))) return;
+    static unsigned char last[4][67 * 16];
+    int slot = tag[0] == 'p' && tag[1] == 'l' ? 0 : (tag[0] == 'p' ? 2 : 1);
+    char mask[68];
+    int changed = 0;
+    for (unsigned int i = 0; i < joints; ++i)
+    {
+        const unsigned char* now = reinterpret_cast<const unsigned char*>(rotations + i * 16);
+        bool differs = memcmp(now, last[slot] + i * 16, 16) != 0;
+        mask[i] = differs ? '1' : '0';
+        if (differs) ++changed;
+        memcpy(last[slot] + i * 16, now, 16);
+    }
+    mask[joints] = 0;
+    Log("anim(%s): changed=%d %s", tag, changed, mask);
+}
+
 static void FrameTick()
 {
     // Both tick sources (engine sync and the controller) may fire in one frame.
@@ -2214,6 +2248,11 @@ static void FrameTick()
     static void* lastPlayer = nullptr;
     void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     ApplyModel();
+    if (g_dumpAnim && (g_updateCalls % 15) == 0)
+    {
+        DumpAnimChanges(localPlayer, "player");
+        DumpAnimChanges(g_puppetObject, "puppet");
+    }
     if (localPlayer != nullptr && localPlayer != lastPlayer)
     {
         if (lastPlayer != nullptr)
