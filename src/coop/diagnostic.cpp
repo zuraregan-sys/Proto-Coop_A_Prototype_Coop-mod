@@ -100,6 +100,7 @@ static void* g_dbSetInt = nullptr;
 static bool g_whipPuppet = false;
 static bool g_puppetNoChoreo = true;
 static bool g_cityCensus = false;
+static bool g_cityPose = false;
 static int g_cityRadius = 300;
 static int g_cityNear = 60;
 static bool g_cityOn = false;
@@ -232,6 +233,7 @@ static void ReadConfig()
     g_cityCensus = GetPrivateProfileIntA("coop", "city_census", 0, path) != 0;
     g_cityRadius = GetPrivateProfileIntA("coop", "city_radius", 300, path);
     g_cityNear = GetPrivateProfileIntA("coop", "city_near", 60, path);
+    g_cityPose = GetPrivateProfileIntA("coop", "city_pose", 0, path) != 0;
     if (g_cityRadius < 20) g_cityRadius = 20;
     g_luaPowers = GetPrivateProfileIntA("coop", "lua_powers", 1, path) != 0;
     g_dumpLua = GetPrivateProfileIntA("coop", "dump_lua", 0, path) != 0;
@@ -2915,6 +2917,7 @@ static void ReplayRemoteTransformations()
 }
 
 static void HandleCitySnapshot(const unsigned char* data, int length);
+static void StoreCityPose(const unsigned char* data, int length);
 
 static void HandlePacket(const unsigned char* data, int length)
 {
@@ -2953,6 +2956,11 @@ static void HandlePacket(const unsigned char* data, int length)
     if (length >= 4 && data[0] == 'A' && data[1] == '1')
     {
         StorePose(data, length);
+        return;
+    }
+    if (length >= 12 && data[0] == 'P' && data[1] == '2')
+    {
+        StoreCityPose(data, length);
         return;
     }
     if (length >= 8 && memcmp(data, "P1", 2) == 0)
@@ -3273,6 +3281,25 @@ struct CityMirror
 static CityMirror g_cityMirrors[CITY_MAX];
 static int g_cityMirrorCount = 0;
 
+// The nearest copies also stream their pose, at 10 Hz, so they do not stand in
+// their bind pose.
+enum
+{
+    CITY_POSE_MAX = 2,
+    CITY_POSE_JOINTS_PER_PACKET = 28
+};
+
+struct CityPose
+{
+    unsigned int id;
+    unsigned short joints;
+    unsigned char buffer[128 * 32];
+    bool valid;
+};
+static CityPose g_cityPoses[CITY_POSE_MAX];
+static void* g_cityObjects[CITY_MAX];
+
+
 static unsigned int ObjectHandleId(void* object)
 {
     if (object == nullptr) return 0;
@@ -3338,6 +3365,7 @@ static int CollectCityEntries(CityEntry* entries, int max)
         entry.qy = static_cast<short>(y * 8.0f);
         entry.qz = static_cast<short>(z * 8.0f);
         entry.yaw = 0;
+        g_cityObjects[count] = object;
         ++count;
     }
     // Vehicles fill the leftover room, a few per snapshot, with the same rule:
@@ -3368,6 +3396,7 @@ static int CollectCityEntries(CityEntry* entries, int max)
         entry.qy = static_cast<short>(y * 8.0f);
         entry.qz = static_cast<short>(z * 8.0f);
         entry.yaw = 1; // marks a vehicle for the log
+        g_cityObjects[count] = nullptr;
         ++count;
         ++vehicles;
     }
@@ -3409,6 +3438,58 @@ static void SendCitySnapshot()
     }
     sendto(g_socket, reinterpret_cast<const char*>(packet), offset, 0, reinterpret_cast<sockaddr*>(&g_peer),
         sizeof(g_peer));
+    // Pose stream for the nearest characters: a chunk of joints per packet.
+    if (g_cityPose)
+    {
+        int streamed = 0;
+        for (int i = 0; i < count && streamed < CITY_POSE_MAX; ++i)
+        {
+            void* object = g_cityObjects[i];
+            if (object == nullptr) continue;
+            unsigned int pose = GetAttributeValue(object, 0x10E80688);
+            if (!Plausible(reinterpret_cast<void*>(pose))) continue;
+            unsigned int joints = ReadU32(reinterpret_cast<void*>(pose), 0x14);
+            static bool loggedPoseSend = false;
+            if (!loggedPoseSend)
+            {
+                loggedPoseSend = true;
+                Log("city: pose send id=%08X joints=%u object=%p", entries[i].id, joints, object);
+            }
+            unsigned int rotations = ReadU32(reinterpret_cast<void*>(pose), 0x18);
+            unsigned int translations = ReadU32(reinterpret_cast<void*>(pose), 0x1C);
+            if (joints == 0 || joints > 128 || !Plausible(reinterpret_cast<void*>(rotations)) ||
+                !Plausible(reinterpret_cast<void*>(translations)))
+                continue;
+            unsigned char posePacket[12 + CITY_POSE_JOINTS_PER_PACKET * 32];
+            unsigned int id = entries[i].id;
+            int sent = 0;
+            for (unsigned int first = 0; first < joints; first += CITY_POSE_JOINTS_PER_PACKET)
+            {
+                unsigned int chunk = joints - first;
+                if (chunk > CITY_POSE_JOINTS_PER_PACKET) chunk = CITY_POSE_JOINTS_PER_PACKET;
+                posePacket[0] = 'P';
+                posePacket[1] = '2';
+                memcpy(posePacket + 2, &id, 4);
+                unsigned short totalJoints = static_cast<unsigned short>(joints);
+                unsigned short firstJoint = static_cast<unsigned short>(first);
+                unsigned short jointCount = static_cast<unsigned short>(chunk);
+                memcpy(posePacket + 6, &totalJoints, 2);
+                memcpy(posePacket + 8, &firstJoint, 2);
+                memcpy(posePacket + 10, &jointCount, 2);
+                int offset = 12;
+                for (unsigned int j = 0; j < chunk; ++j)
+                {
+                    memcpy(posePacket + offset, reinterpret_cast<void*>(rotations + (first + j) * 16), 16);
+                    memcpy(posePacket + offset + 16, reinterpret_cast<void*>(translations + (first + j) * 16), 16);
+                    offset += 32;
+                }
+                sendto(g_socket, reinterpret_cast<const char*>(posePacket), offset, 0,
+                    reinterpret_cast<sockaddr*>(&g_peer), sizeof(g_peer));
+                ++sent;
+            }
+            ++streamed;
+        }
+    }
     ++g_citySendCount;
     static unsigned int lastLog = 0;
     unsigned int now = GetTickCount();
@@ -3528,6 +3609,81 @@ static void ProcessCitySnapshot()
         g_cityMirrors[found].lastSeen = now;
         SetObjectPosition(g_cityMirrors[found].object, qx / 8.0f, qy / 8.0f, qz / 8.0f);
     }
+}
+
+// Applies a streamed pose to a city copy: same steps the avatar uses.
+static void ApplyCityPose(CityPose& pose)
+{
+    if (!pose.valid || pose.joints == 0) return;
+    for (int k = 0; k < g_cityMirrorCount; ++k)
+    {
+        if (g_cityMirrors[k].object == nullptr || g_cityMirrors[k].id != pose.id) continue;
+        void* object = g_cityMirrors[k].object;
+        unsigned int posePtr = GetAttributeValue(object, 0x10E80688);
+        if (!Plausible(reinterpret_cast<void*>(posePtr))) return;
+        unsigned int joints = ReadU32(reinterpret_cast<void*>(posePtr), 0x14);
+        if (joints != pose.joints) return;
+        unsigned int rotations = ReadU32(reinterpret_cast<void*>(posePtr), 0x18);
+        unsigned int translations = ReadU32(reinterpret_cast<void*>(posePtr), 0x1C);
+        if (!Plausible(reinterpret_cast<void*>(rotations)) || !Plausible(reinterpret_cast<void*>(translations)))
+            return;
+        for (unsigned int i = 0; i < joints; ++i)
+        {
+            memcpy(reinterpret_cast<void*>(rotations + i * 16), pose.buffer + i * 32, 16);
+            memcpy(reinterpret_cast<void*>(translations + i * 16), pose.buffer + i * 32 + 16, 16);
+        }
+        *(unsigned char*)(posePtr + 0x40) |= 3;
+        reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006DD6E0))(reinterpret_cast<void*>(posePtr));
+        // The copy keeps its own RenderBehaviour, which publishes the object
+        // pose into the drawable on its own update: writing the pose is enough
+        // (the avatar needs the explicit copy only because its drawable was
+        // swapped by hand).
+        static bool loggedPose = false;
+        if (!loggedPose)
+        {
+            loggedPose = true;
+            Log("city: pose applied id=%08X joints=%u object=%p", pose.id, joints, object);
+        }
+        return;
+    }
+}
+
+static void StoreCityPose(const unsigned char* data, int length)
+{
+    if (length < 12) return;
+    static bool loggedRecv = false;
+    if (!loggedRecv)
+    {
+        loggedRecv = true;
+        Log("city: pose recv len=%d", length);
+    }
+    unsigned int id = 0;
+    memcpy(&id, data + 2, 4);
+    unsigned short joints = 0, first = 0, count = 0;
+    memcpy(&joints, data + 6, 2);
+    memcpy(&first, data + 8, 2);
+    memcpy(&count, data + 10, 2);
+    if (joints == 0 || joints > 128 || count > joints || first + count > joints) return;
+    if (length < 12 + count * 32) return;
+    CityPose* target = nullptr;
+    for (int k = 0; k < CITY_POSE_MAX; ++k)
+    {
+        if (g_cityPoses[k].id == id) { target = &g_cityPoses[k]; break; }
+    }
+    if (target == nullptr)
+    {
+        for (int k = 0; k < CITY_POSE_MAX; ++k)
+            if (g_cityPoses[k].id == 0) { target = &g_cityPoses[k]; break; }
+        if (target == nullptr) target = &g_cityPoses[0];
+        target->id = id;
+        target->joints = joints;
+        target->valid = false;
+    }
+    if (target->joints != joints) return;
+    for (unsigned int j = 0; j < count; ++j)
+        memcpy(target->buffer + (first + j) * 32, data + 12 + j * 32, 32);
+    if (first + count >= joints) target->valid = true;
+    ApplyCityPose(*target);
 }
 
 // Mirrors that stop arriving are moved out of sight and their slot is reused.

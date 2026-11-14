@@ -54,8 +54,9 @@ are moved out of sight and their slot is reused.
 
 Actors closer than `city_near` (60 m) to the **peer** are never sent: they already
 live in its world, so skipping them is what keeps the shared area free of double
-NPCs. The copies are still static (no animation); when the players separate, each
-one sees the other's surroundings populated.
+NPCs. The copies are static (no animation) for now: driving their pose faults in
+the engine, so the stream stays behind `city_pose=0`. When the players separate,
+each one sees the other's surroundings populated.
 
 ## How it works right now (for testing)
 
@@ -111,6 +112,7 @@ puppet_nochoreo=1    ; 1 = keep the avatar out of the engine's animation jobs (d
 city_radius=300      ; stream the characters around each player within this radius
 city_census=0        ; 1 = log the city composition around the player every 2 s
 city_near=60         ; actors this close to the peer are not mirrored (no duplicates)
+city_pose=0          ; 1 = stream the nearest copies' poses (faults in the engine)
 ```
 
 ## Building

@@ -46,7 +46,10 @@ del snapshot, sin cuelgues ni crashes.
 
 ## Pendiente (requiere investigacion de motor)
 
-- [ ] Animar las copias de la ciudad (pose de los mas cercanos o idle propio).
+- [ ] Animar las copias de la ciudad: intentado con `P2` (pose de los mas
+      cercanos); aplicar la pose revienta en el motor (`Pose::Update` -> call
+      nulo y `Drawable::GetSkeleton` con drawables muertos). Queda tras
+      `city_pose=0` hasta encontrar una via segura.
 - [ ] Latigo en el actor remoto y su tendril (el contenido no admite dos actores).
 - [ ] Efectos anclados y motion trails.
 - [ ] Disfraz.
