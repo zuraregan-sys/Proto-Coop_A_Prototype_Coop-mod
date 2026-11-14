@@ -121,6 +121,7 @@ city_pose=0          ; reserved (driving the copies' poses faults in the engine)
 city_dump=1          ; 1 = log template/behaviour of the actors around the player
 transport=udp        ; udp (peer_ip) | steam (lobby + invite)
 steam_invite=1       ; 1 = open the Steam invite dialog when the lobby is created
+role=auto            ; auto | host | client (auto: lobby creator is host)
 steam_lobby=0        ; optional: join this lobby id instead of waiting for an invite
 ```
 
@@ -136,8 +137,6 @@ Outputs `build\coop\prototype_coop.asi` and `build\coop\xinput1_3.dll`.
 
 ## Play with friends
 
-Steam handles the connection: no IPs, no port forwarding, no router.
-
 1. Both players need their own **Prototype (Steam, App ID 10150)** and
    **PrototypeFix** installed (PrototypeFix is the ASI loader the game uses).
 2. Build the mod and create the friend package:
@@ -150,12 +149,16 @@ Steam handles the connection: no IPs, no port forwarding, no router.
    `dist\ProtoCoop-<build>.zip` contains the mod (`prototype_coop.asi`), a
    pinned `steam_api.dll`, `steam_appid.txt` (480), a `coop.ini` template and a
    plain-words `LEEME.txt`. No game files.
-3. Both copy the contents next to `prototypef.exe` and set `transport=steam`
-   in `coop.ini`; the host uses `role=host` and the guest `role=client`.
-4. The host starts the game: the mod creates a friends-only lobby and opens the
-   Steam invite dialog. The guest starts the game and accepts the invite.
-5. Progress: on one PC both instances share the save folder. For two PCs copy
-   the host's slots first with `tools\sync-save.ps1`.
+3. Both copy the contents next to `prototypef.exe`. With `transport=steam` and
+   `role=auto` (the defaults) there is nothing else to configure.
+4. The host starts the game: a small **Prototype Co-op** window appears with the
+   Steam name, an **Invitar a un amigo** button (opens the Steam friends list)
+   and **Iniciar partida**. The friend starts the game, accepts the invite and
+   their name appears in the lobby. **Iniciar partida** sends the host's save to
+   the guest and starts both games on the same slot; the guest is loaded in the
+   same place at the same point of the story.
+5. The person who creates the lobby is the host and the one who accepts the
+   invite is the guest: nobody edits files to pick a role.
 
 The game appears as AppID 480 ("Spacewar") in Steam, which is the standard relay
 trick for mods. Two instances on the same PC share one Steam account and
@@ -164,7 +167,8 @@ therefore cannot talk to each other over Steam; use `transport=udp` with
 
 ### LAN or VPN (fallback)
 
-`transport=udp` (the default) sends to `peer_ip:peer_port`:
+`transport=udp` (the default only when Steam is unavailable) sends to
+`peer_ip:peer_port`:
 
 | | Host | Guest |
 |---|---|---|

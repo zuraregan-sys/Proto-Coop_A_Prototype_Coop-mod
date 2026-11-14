@@ -38,7 +38,7 @@ $DiagObj = Join-Path $Build "diagnostic.o"
 if ($LASTEXITCODE -ne 0) { throw "compile failed: diagnostic.cpp" }
 
 $Out = Join-Path $Build "prototype_coop.asi"
-& $ClangPP @Common -shared -o $Out $DiagObj $Objects -static -static-libgcc -static-libstdc++ -lws2_32
+& $ClangPP @Common -shared -o $Out $DiagObj $Objects -static -static-libgcc -static-libstdc++ -lws2_32 -lgdi32 -luser32
 if ($LASTEXITCODE -ne 0) { throw "link failed" }
 Write-Host "built $Out"
 

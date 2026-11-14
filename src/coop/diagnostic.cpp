@@ -76,6 +76,24 @@ static bool g_steamTransport = false;
 static bool g_steamReady = false;
 static unsigned long long g_steamPeer = 0;
 static bool g_steamInvite = true;
+static bool g_roleAuto = false;
+static bool g_lobbyStarted = false;
+static bool g_steamSolo = false;
+static unsigned char* g_sendSave = nullptr;
+static unsigned int g_sendSaveSize = 0;
+static unsigned int g_sendSaveOffset = 0;
+static char g_sendSaveName[64] = "";
+static bool g_sendStartAfterSave = false;
+static unsigned char* g_recvSave = nullptr;
+static unsigned int g_recvSaveSize = 0;
+static unsigned int g_recvSaveOffset = 0;
+static char g_recvSaveName[64] = "";
+static char g_persona[64] = "";
+static char g_guestName[64] = "";
+static HWND g_lobbyWindow = nullptr;
+static HFONT g_lobbyFont = nullptr;
+static RECT g_inviteRect;
+static RECT g_startRect;
 static bool g_isHost = true;
 static int g_testMove = 0;
 static bool g_testMoved = false;
@@ -220,7 +238,10 @@ static void ReadConfig()
 
     char role[32] = "host";
     GetPrivateProfileStringA("coop", "role", "host", role, sizeof(role), path);
-    g_isHost = (role[0] == 'h' || role[0] == 'H');
+    g_roleAuto = (role[0] == 'a' || role[0] == 'A');
+    // auto: whoever creates the lobby is the host; accepting an invite makes
+    // this side the guest. Start as host until a friend's lobby is joined.
+    g_isHost = g_roleAuto ? true : (role[0] == 'h' || role[0] == 'H');
     g_localPort = (unsigned short)GetPrivateProfileIntA("coop", "port", g_isHost ? 27016 : 27017, path);
     g_peerPort = (unsigned short)GetPrivateProfileIntA("coop", "peer_port", g_isHost ? 27017 : 27016, path);
     GetPrivateProfileStringA("coop", "peer_ip", "127.0.0.1", g_peerIp, sizeof(g_peerIp), path);
@@ -229,6 +250,7 @@ static void ReadConfig()
     GetPrivateProfileStringA("coop", "transport", "udp", transportValue, sizeof(transportValue), path);
     g_steamTransport = (transportValue[0] == 's' || transportValue[0] == 'S');
     g_steamInvite = GetPrivateProfileIntA("coop", "steam_invite", 1, path) != 0;
+    g_steamSolo = GetPrivateProfileIntA("coop", "steam_solo", 0, path) != 0;
     g_peerMask = g_isHost ? 1 : 2;
     g_testMove = GetPrivateProfileIntA("coop", "test_move", 0, path);
     g_testOffsetY = (float)GetPrivateProfileIntA("coop", "test_offset_y", 0, path);
@@ -372,6 +394,10 @@ typedef int (__cdecl* SteamSendToUserFn)(void*, const void*, const void*, unsign
 typedef int (__cdecl* SteamReceiveFn)(void*, int, void**, int);
 typedef bool (__cdecl* SteamAcceptFn)(void*, const void*);
 typedef void (__cdecl* SteamReleaseFn)(void*);
+typedef const char* (__cdecl* SteamPersonaFn)(void*);
+typedef const char* (__cdecl* SteamFriendPersonaFn)(void*, unsigned long long);
+typedef int (__cdecl* SteamLobbyMemberCountFn)(void*, unsigned long long);
+typedef unsigned long long (__cdecl* SteamLobbyMemberFn)(void*, unsigned long long, int);
 
 static SteamInitFlatFn SteamInitFlat = nullptr;
 static SteamGetHSteamPipeFn SteamGetPipe = nullptr;
@@ -398,6 +424,10 @@ static SteamSendToUserFn SteamSendToUser = nullptr;
 static SteamReceiveFn SteamReceive = nullptr;
 static SteamAcceptFn SteamAccept = nullptr;
 static SteamReleaseFn SteamReleaseMsg = nullptr;
+static SteamPersonaFn SteamPersona = nullptr;
+static SteamFriendPersonaFn SteamFriendPersona = nullptr;
+static SteamLobbyMemberCountFn SteamLobbyMemberCount = nullptr;
+static SteamLobbyMemberFn SteamLobbyMember = nullptr;
 
 static bool SteamApiLoaded()
 {
@@ -462,7 +492,12 @@ static void SteamPoll()
                 update->userChanged != g_steamId)
             {
                 g_steamPeer = update->userChanged;
-                Log("steam: guest=%llu joined", g_steamPeer);
+                if (SteamFriendPersona != nullptr && g_steamFriends != nullptr)
+                {
+                    const char* name = SteamFriendPersona(g_steamFriends, g_steamPeer);
+                    if (name != nullptr) strncpy_s(g_guestName, sizeof(g_guestName), name, _TRUNCATE);
+                }
+                Log("steam: guest=%llu joined (%s)", g_steamPeer, g_guestName);
             }
         }
         else if (msg.callback == 333)
@@ -471,6 +506,9 @@ static void SteamPoll()
             if (join != nullptr)
             {
                 Log("steam: joining lobby %llu", join->lobby);
+                // Accepting an invite always makes this side the guest.
+                g_isHost = false;
+                g_steamPeer = join->friendId;
                 SteamJoinLobby(g_steamMatchmaking, join->lobby);
             }
         }
@@ -494,6 +532,312 @@ static void SteamPoll()
         unsigned int size = *reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned char*>(message) + 4);
         if (data != nullptr && size > 0) HandlePacket(data, (int)size);
         SteamReleaseMsg(message);
+    }
+}
+
+// --- lobby window ----------------------------------------------------------
+// A small always-on-top window drawn by the plugin: it shows the Steam names in
+// the lobby, opens the invite dialog and starts the session. It is not a button
+// inside the game's Flash menu, but it needs no menu patching and works the same
+// in the front end and in game.
+
+static void WriteStartFlag()
+{
+    char path[MAX_PATH];
+    strcpy_s(path, MAX_PATH, g_iniPath);
+    char* slash = strrchr(path, '\\');
+    if (slash == nullptr) return;
+    strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "coop_start.txt");
+    FILE* file = nullptr;
+    if (fopen_s(&file, path, "w") == 0 && file != nullptr)
+    {
+        fputs("go\n", file);
+        fclose(file);
+    }
+}
+
+// Saves live in the user's Documents folder for both instances (and for the
+// other PC after the transfer).
+static bool SaveFolder(char* path, size_t size)
+{
+    char profile[MAX_PATH];
+    DWORD n = GetEnvironmentVariableA("USERPROFILE", profile, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    sprintf_s(path, size, "%s\\Documents\\Prototype", profile);
+    return true;
+}
+
+static void SendSaveChunks()
+{
+    if (g_sendSave == nullptr) return;
+    if (g_sendSaveOffset >= g_sendSaveSize)
+    {
+        free(g_sendSave);
+        g_sendSave = nullptr;
+        g_sendSaveSize = 0;
+        g_sendSaveOffset = 0;
+        if (g_sendStartAfterSave)
+        {
+            g_sendStartAfterSave = false;
+            static const unsigned char go[2] = { 'G', 'O' };
+            NetSend(go, sizeof(go));
+        }
+        return;
+    }
+    unsigned int chunk = g_sendSaveSize - g_sendSaveOffset;
+    if (chunk > 900) chunk = 900;
+    unsigned char packet[12 + 64 + 900];
+    packet[0] = 'F';
+    packet[1] = '1';
+    memcpy(packet + 2, &g_sendSaveSize, 4);
+    memcpy(packet + 6, &g_sendSaveOffset, 4);
+    unsigned short nameLength = static_cast<unsigned short>(strlen(g_sendSaveName));
+    memcpy(packet + 10, &nameLength, 2);
+    memcpy(packet + 12, g_sendSaveName, nameLength);
+    memcpy(packet + 12 + nameLength, g_sendSave + g_sendSaveOffset, chunk);
+    NetSend(packet, 12 + nameLength + chunk);
+    g_sendSaveOffset += chunk;
+}
+
+static void QueueSaveTransfer()
+{
+    if (g_sendSave != nullptr) return;
+    char folder[MAX_PATH];
+    if (!SaveFolder(folder, sizeof(folder))) return;
+    char pattern[MAX_PATH];
+    sprintf_s(pattern, "%s\\slot-*.bin", folder);
+    WIN32_FIND_DATAA data;
+    HANDLE find = FindFirstFileA(pattern, &data);
+    if (find == INVALID_HANDLE_VALUE) return;
+    char best[MAX_PATH] = "";
+    ULARGE_INTEGER bestTime = { 0, 0 };
+    do
+    {
+        ULARGE_INTEGER stamp;
+        stamp.LowPart = data.ftLastWriteTime.dwLowDateTime;
+        stamp.HighPart = data.ftLastWriteTime.dwHighDateTime;
+        if (stamp.QuadPart > bestTime.QuadPart)
+        {
+            bestTime = stamp;
+            strcpy_s(best, MAX_PATH, data.cFileName);
+        }
+    } while (FindNextFileA(find, &data));
+    FindClose(find);
+    if (best[0] == 0) return;
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\%s", folder, best);
+    FILE* file = nullptr;
+    if (fopen_s(&file, path, "rb") != 0 || file == nullptr) return;
+    fseek(file, 0, SEEK_END);
+    long size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (size <= 0 || size > 8 * 1024 * 1024)
+    {
+        fclose(file);
+        return;
+    }
+    g_sendSave = static_cast<unsigned char*>(malloc(size));
+    if (g_sendSave == nullptr)
+    {
+        fclose(file);
+        return;
+    }
+    if (fread(g_sendSave, 1, size, file) != (size_t)size)
+    {
+        free(g_sendSave);
+        g_sendSave = nullptr;
+        fclose(file);
+        return;
+    }
+    fclose(file);
+    g_sendSaveSize = static_cast<unsigned int>(size);
+    g_sendSaveOffset = 0;
+    strcpy_s(g_sendSaveName, sizeof(g_sendSaveName), best);
+    Log("save: sending %s (%u bytes)", g_sendSaveName, g_sendSaveSize);
+}
+
+static void ReceiveSaveChunk(const unsigned char* data, int length)
+{
+    if (length < 12) return;
+    unsigned int total = 0, offset = 0;
+    unsigned short nameLength = 0;
+    memcpy(&total, data + 2, 4);
+    memcpy(&offset, data + 6, 4);
+    memcpy(&nameLength, data + 10, 2);
+    if (total == 0 || total > 8 * 1024 * 1024 || nameLength >= 64) return;
+    if (length < 12 + nameLength) return;
+    char name[64];
+    memcpy(name, data + 12, nameLength);
+    name[nameLength] = 0;
+    if (strncmp(name, "slot-", 5) != 0 || strstr(name, "..") != nullptr) return;
+    if (g_recvSave == nullptr || g_recvSaveSize != total || strcmp(g_recvSaveName, name) != 0)
+    {
+        free(g_recvSave);
+        g_recvSave = static_cast<unsigned char*>(malloc(total));
+        if (g_recvSave == nullptr) return;
+        g_recvSaveSize = total;
+        g_recvSaveOffset = 0;
+        strcpy_s(g_recvSaveName, sizeof(g_recvSaveName), name);
+    }
+    int chunk = length - 12 - nameLength;
+    if (offset + chunk > g_recvSaveSize) return;
+    memcpy(g_recvSave + offset, data + 12 + nameLength, chunk);
+    if (offset + chunk > g_recvSaveOffset) g_recvSaveOffset = offset + chunk;
+    if (g_recvSaveOffset < g_recvSaveSize) return;
+    char folder[MAX_PATH];
+    if (!SaveFolder(folder, sizeof(folder))) return;
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\%s", folder, g_recvSaveName);
+    char backup[MAX_PATH];
+    sprintf_s(backup, "%s\\%s.bak", folder, g_recvSaveName);
+    CopyFileA(path, backup, FALSE);
+    FILE* file = nullptr;
+    if (fopen_s(&file, path, "wb") == 0 && file != nullptr)
+    {
+        fwrite(g_recvSave, 1, g_recvSaveSize, file);
+        fclose(file);
+        Log("save: received %s (%u bytes)", g_recvSaveName, g_recvSaveSize);
+    }
+    free(g_recvSave);
+    g_recvSave = nullptr;
+    g_recvSaveSize = 0;
+    g_recvSaveOffset = 0;
+}
+
+static void StartSession()
+{
+    if (g_lobbyStarted) return;
+    g_lobbyStarted = true;
+    Log("lobby: start requested (host=%d)", g_isHost ? 1 : 0);
+    if (g_isHost)
+    {
+        // Send the host's save first, then tell the guest to start: both load
+        // the same slot and begin at the same point in the story.
+        QueueSaveTransfer();
+        if (g_sendSave != nullptr)
+        {
+            // The guest starts once the save has arrived.
+            g_sendStartAfterSave = true;
+        }
+        else
+        {
+            static const unsigned char go[2] = { 'G', 'O' };
+            NetSend(go, sizeof(go));
+        }
+    }
+    WriteStartFlag();
+    if (g_lobbyWindow != nullptr) ShowWindow(g_lobbyWindow, SW_HIDE);
+}
+
+static void DrawLobby(HDC dc)
+{
+    RECT client;
+    GetClientRect(g_lobbyWindow, &client);
+    HBRUSH background = CreateSolidBrush(RGB(18, 22, 26));
+    FillRect(dc, &client, background);
+    DeleteObject(background);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(235, 240, 245));
+    if (g_lobbyFont == nullptr)
+        g_lobbyFont = CreateFontA(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, "Segoe UI");
+    HGDIOBJ oldFont = SelectObject(dc, g_lobbyFont);
+    TextOutA(dc, 18, 14, "Prototype Co-op", 15);
+    SetTextColor(dc, RGB(160, 200, 235));
+    char line[160];
+    sprintf_s(line, "Tu: %s", g_persona[0] != 0 ? g_persona : "?");
+    TextOutA(dc, 18, 52, line, (int)strlen(line));
+    if (g_isHost)
+    {
+        sprintf_s(line, "Invitado: %s", g_guestName[0] != 0 ? g_guestName : "(nadie todavia)");
+        TextOutA(dc, 18, 78, line, (int)strlen(line));
+        SetRect(&g_inviteRect, 18, 120, 200, 152);
+        SetRect(&g_startRect, 216, 120, 402, 152);
+        HBRUSH inviteBrush = CreateSolidBrush(RGB(40, 76, 110));
+        FillRect(dc, &g_inviteRect, inviteBrush);
+        DeleteObject(inviteBrush);
+        HBRUSH startBrush = CreateSolidBrush(g_steamPeer != 0 ? RGB(38, 110, 60) : RGB(60, 60, 60));
+        FillRect(dc, &g_startRect, startBrush);
+        DeleteObject(startBrush);
+        SetTextColor(dc, RGB(240, 245, 250));
+        TextOutA(dc, 32, 128, "Invitar a un amigo", 18);
+        TextOutA(dc, 230, 128, "Iniciar partida", 15);
+    }
+    else
+    {
+        SetTextColor(dc, RGB(160, 200, 235));
+        TextOutA(dc, 18, 78, "Esperando al anfitrion...", 25);
+    }
+    SelectObject(dc, oldFont);
+}
+
+static LRESULT CALLBACK LobbyProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+{
+    if (message == WM_PAINT)
+    {
+        PAINTSTRUCT paint;
+        HDC dc = BeginPaint(hwnd, &paint);
+        DrawLobby(dc);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    if (message == WM_ERASEBKGND) return 1;
+    if (message == WM_LBUTTONUP)
+    {
+        POINT point = { static_cast<LONG>(static_cast<short>(LOWORD(lparam))),
+            static_cast<LONG>(static_cast<short>(HIWORD(lparam))) };
+        if (g_isHost)
+        {
+            if (PtInRect(&g_inviteRect, point) && g_steamFriends != nullptr && g_steamLobby != 0)
+            {
+                SteamInviteDialog(g_steamFriends, g_steamLobby);
+                return 0;
+            }
+            if (PtInRect(&g_startRect, point) && (g_steamPeer != 0 || g_steamSolo)) StartSession();
+        }
+        return 0;
+    }
+    if (message == WM_CLOSE)
+    {
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, message, wparam, lparam);
+}
+
+static void CreateLobbyWindow()
+{
+    if (g_lobbyWindow != nullptr) return;
+    static bool registered = false;
+    if (!registered)
+    {
+        WNDCLASSEXA cls = { 0 };
+        cls.cbSize = sizeof(cls);
+        cls.lpfnWndProc = LobbyProc;
+        cls.hInstance = GetModuleHandleA("prototype_coop.asi");
+        cls.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+        cls.lpszClassName = "ProtoCoopLobby";
+        RegisterClassExA(&cls);
+        registered = true;
+    }
+    RECT work;
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
+    int width = 420;
+    int height = 180;
+    g_lobbyWindow = CreateWindowExA(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, "ProtoCoopLobby", "Prototype Co-op",
+        WS_POPUP | WS_BORDER, work.left + 40, work.top + 40, width, height, nullptr, nullptr,
+        GetModuleHandleA("prototype_coop.asi"), nullptr);
+    if (g_lobbyWindow != nullptr) ShowWindow(g_lobbyWindow, SW_SHOW);
+}
+
+static void PumpLobby()
+{
+    if (g_lobbyWindow == nullptr) return;
+    MSG message;
+    while (PeekMessageA(&message, g_lobbyWindow, 0, 0, PM_REMOVE))
+    {
+        TranslateMessage(&message);
+        DispatchMessageA(&message);
     }
 }
 
@@ -536,6 +880,14 @@ static bool SteamStart()
         GetProcAddress(g_steamDll, "SteamAPI_SteamNetworkingIdentity_SetSteamID64"));
     SteamReleaseMsg = reinterpret_cast<SteamReleaseFn>(
         GetProcAddress(g_steamDll, "SteamAPI_SteamNetworkingMessage_t_Release"));
+    SteamPersona = reinterpret_cast<SteamPersonaFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamFriends_GetPersonaName"));
+    SteamFriendPersona = reinterpret_cast<SteamFriendPersonaFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamFriends_GetFriendPersonaName"));
+    SteamLobbyMemberCount = reinterpret_cast<SteamLobbyMemberCountFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamMatchmaking_GetNumLobbyMembers"));
+    SteamLobbyMember = reinterpret_cast<SteamLobbyMemberFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex"));
     SteamCreateLobby = reinterpret_cast<SteamCreateLobbyFn>(
         GetProcAddress(g_steamDll, "SteamAPI_ISteamMatchmaking_CreateLobby"));
     SteamJoinLobby = reinterpret_cast<SteamJoinLobbyFn>(
@@ -601,6 +953,15 @@ static bool SteamStart()
     g_steamFriends = SteamFriendsInterface();
     g_steamMessages = SteamMessagesInterface();
     g_steamId = SteamGetId(g_steamUser);
+    if (SteamPersona != nullptr && g_steamFriends != nullptr)
+    {
+        const char* name = SteamPersona(g_steamFriends);
+        if (name != nullptr)
+        {
+            strncpy_s(g_persona, sizeof(g_persona), name, _TRUNCATE);
+            Log("steam: persona=%s", g_persona);
+        }
+    }
     Log("steam: ready id=%llu logged=%d", g_steamId, SteamLoggedOn(g_steamUser) ? 1 : 0);
     if (g_isHost)
     {
@@ -3298,6 +3659,16 @@ static void HandlePacket(const unsigned char* data, int length)
         SpawnRemoteEffect(data, length);
         return;
     }
+    if (length >= 12 && data[0] == 'F' && data[1] == '1')
+    {
+        ReceiveSaveChunk(data, length);
+        return;
+    }
+    if (length >= 2 && data[0] == 'G' && data[1] == 'O')
+    {
+        if (!g_isHost) StartSession();
+        return;
+    }
     if (length >= 6 && data[0] == 'C' && (data[1] == '1' || data[1] == '2'))
     {
         HandleCitySnapshot(data, length);
@@ -4130,6 +4501,8 @@ static void FrameTick()
     }
 
     if (g_steamReady) SteamPoll();
+    if (g_sendSave != nullptr && (g_updateCalls % 4) == 0) SendSaveChunks();
+    if (g_steamReady && !g_lobbyStarted) { CreateLobbyWindow(); PumpLobby(); }
     PollSocket();
     g_phase = 2;
 

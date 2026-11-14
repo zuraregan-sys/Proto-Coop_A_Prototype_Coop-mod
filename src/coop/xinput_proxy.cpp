@@ -131,6 +131,11 @@ namespace
     char g_statePath[MAX_PATH] = { 0 };
     DWORD g_stateChecked = 0;
     bool g_gameRunning = false;
+    char g_startPath[MAX_PATH] = { 0 };
+    DWORD g_startChecked = 0;
+    bool g_startRequested = false;
+    DWORD g_scriptStart = 0;
+    bool g_scriptRunning = false;
 
     // The plugin writes "game" once a player object exists; until then the
     // scripted menu repeats, so a slow front end still gets driven.
@@ -141,6 +146,24 @@ namespace
         char* slash = strrchr(g_statePath, '\\');
         if (slash == nullptr) { g_statePath[0] = 0; return; }
         strcpy_s(slash + 1, MAX_PATH - (slash + 1 - g_statePath), "coop_menu.txt");
+        strcpy_s(g_startPath, MAX_PATH, g_statePath);
+        char* startSlash = strrchr(g_startPath, '\\');
+        if (startSlash != nullptr)
+            strcpy_s(startSlash + 1, MAX_PATH - (startSlash + 1 - g_startPath), "coop_start.txt");
+    }
+
+    // The lobby's Start button writes coop_start.txt; until then the real device
+    // is forwarded so the player can use the menu normally.
+    bool StartRequested()
+    {
+        DWORD now = GetTickCount();
+        if (now - g_startChecked < 500) return g_startRequested;
+        g_startChecked = now;
+        if (g_startPath[0] == 0) return false;
+        FILE* file = nullptr;
+        g_startRequested = (fopen_s(&file, g_startPath, "r") == 0 && file != nullptr);
+        if (file != nullptr) fclose(file);
+        return g_startRequested;
     }
 
     bool GameRunning()
@@ -211,9 +234,15 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
 {
     if (user == 0 && state != nullptr)
     {
-        DWORD elapsed = GetTickCount() - g_start;
-        // Once the plugin reports gameplay, or after the script has had its
-        // chances, the real device is forwarded again.
+        // Nothing is driven until the lobby starts; the player is in the menu.
+        if (!StartRequested())
+            return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
+        if (!g_scriptRunning)
+        {
+            g_scriptRunning = true;
+            g_scriptStart = GetTickCount();
+        }
+        DWORD elapsed = GetTickCount() - g_scriptStart;
         if (GameRunning()) return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
         // Repeat the whole sequence every 22 s while the game has not reached
         // gameplay, so a slow front end is still driven into the save list.

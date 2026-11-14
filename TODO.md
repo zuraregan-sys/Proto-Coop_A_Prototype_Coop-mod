@@ -67,4 +67,11 @@ del snapshot, sin cuelgues ni crashes.
 - [x] Verificado en local: init de Steamworks, creacion/entrada de lobby y carga de
       las dos instancias. El enlace P2P real necesita dos cuentas de Steam.
 - [x] Automatizacion del menu robusta (repeticion hasta que hay jugador).
+- [x] Rol automatico (`role=auto`): crea el lobby = host, acepta invitacion = guest.
+- [x] Ventana de lobby con nombre de Steam, lista de invitados, boton de invitar
+      (overlay de Steam) y boton de iniciar.
+- [x] Inicio de partida: envia el save del host al cliente y arranca la carga en
+      los dos a la vez (flag coop_start.txt + secuencia del proxy).
+- [ ] Probar el enlace real con dos cuentas de Steam (lobby, nombres, invitacion,
+      transferencia de save).
 - Sincronizacion de enemigos y bosses
