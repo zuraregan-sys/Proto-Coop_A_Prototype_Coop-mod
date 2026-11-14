@@ -36,10 +36,22 @@ Overall                                ############--------  61%
 | Equip / unequip | ok | Both directions; reverting to normal hands uses the stock "no power" name |
 | Armour & shield | ok | Same path as the arm powers |
 | Whip Fist | local only | The whip cannot be worn by two actors in one process (engine limit), so the remote puppet keeps its previous appearance; the connecting tendril is not replicated either |
+| City (characters) | partial | Characters around each player are mirrored on the peer while both players are close; the copies are static (no AI, animation or physics) and the local world is not suppressed yet |
 | Effects | partial | World effects (spikes, explosions) replicate; attached effects and motion trails pending |
 | Disguise | pending | Separate subsystem (`DisguiseMessage`), not replicated yet |
 | Impact slow motion | removed | Disabled by default to keep the two games in sync (`no_slow_motion=1`) |
 | Steam install untouched | ok | The mod runs from copies in `TestInstances\` |
+
+### City replication
+
+While the two players are within 150 m of each other (the stream stops at 200 m),
+each side sends the characters it has within `city_radius` (32 at most, 4 Hz) as
+`C1` packets: sender id, template hash, quantized position and facing. The peer
+resolves the template by hash in its own content and spawns a visual copy with
+every behaviour except the render one switched off, so it cannot fight, move on
+its own or run mission code. Copies that stop arriving are moved out of sight and
+their slot is reused. The local city is **not** suppressed yet, so in the shared
+area both players see their own characters plus the peer's copies.
 
 ## How it works right now (for testing)
 
@@ -92,6 +104,8 @@ sync_model=0         ; legacy archetype swap (unused while lua_powers=1)
 dump_lua=0           ; 1 = log the power catalog, HUD writes and every Lua call
 whip_puppet=0        ; 1 = also apply the whip to the puppet (crashes: engine limit)
 puppet_nochoreo=1    ; 1 = keep the avatar out of the engine's animation jobs (default)
+city_radius=300      ; stream the characters around each player within this radius
+city_census=0        ; 1 = log the city composition around the player every 2 s
 ```
 
 ## Building

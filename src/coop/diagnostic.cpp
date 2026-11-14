@@ -100,6 +100,12 @@ static void* g_dbSetInt = nullptr;
 static bool g_whipPuppet = false;
 static bool g_puppetNoChoreo = true;
 static bool g_cityCensus = false;
+static int g_cityRadius = 300;
+static bool g_cityOn = false;
+static unsigned int g_citySendCount = 0;
+static unsigned int g_cityRecvCount = 0;
+static unsigned int g_cityMirrorSpawns = 0;
+static unsigned int g_cityMissingTemplates = 0;
 static volatile long g_luaWindowUntil = 0;
 static bool g_forceSwap = false;
 static bool g_transformStart = false;
@@ -223,6 +229,8 @@ static void ReadConfig()
     g_whipPuppet = GetPrivateProfileIntA("coop", "whip_puppet", 0, path) != 0;
     g_puppetNoChoreo = GetPrivateProfileIntA("coop", "puppet_nochoreo", 1, path) != 0;
     g_cityCensus = GetPrivateProfileIntA("coop", "city_census", 0, path) != 0;
+    g_cityRadius = GetPrivateProfileIntA("coop", "city_radius", 300, path);
+    if (g_cityRadius < 20) g_cityRadius = 20;
     g_luaPowers = GetPrivateProfileIntA("coop", "lua_powers", 1, path) != 0;
     g_dumpLua = GetPrivateProfileIntA("coop", "dump_lua", 0, path) != 0;
     g_forceSwap = GetPrivateProfileIntA("coop", "force_swap", 0, path) != 0;
@@ -299,7 +307,9 @@ static const float* ReadInlineMatrix(void* object)
 {
     if (object == nullptr) return nullptr;
     void* transformAttribute = *(void**)(reinterpret_cast<unsigned char*>(object) + 0x1c);
-    if (transformAttribute == nullptr) return nullptr;
+    // A stale master-table entry can carry anything in the transform slot; the
+    // matrix is read through it, so it must be a real pointer.
+    if (!Plausible(transformAttribute)) return nullptr;
     return reinterpret_cast<const float*>(reinterpret_cast<unsigned char*>(transformAttribute) + 4);
 }
 
@@ -523,6 +533,44 @@ struct SpawnRecord
 static SpawnRecord g_spawns[4096];
 static volatile long g_spawnCount = 0;
 
+// Spawn records are a ring and every streamed NPC adds to it, so a small open
+// addressed table keeps the live objects' templates resolvable.
+struct TemplateIndexEntry
+{
+    void* object;
+    void* tmpl;
+};
+static TemplateIndexEntry g_templateIndex[1 << 16];
+
+static void IndexTemplate(void* object, void* tmpl)
+{
+    if (object == nullptr || tmpl == nullptr) return;
+    unsigned int slot = (reinterpret_cast<unsigned int>(object) >> 4) & 0xFFFF;
+    for (int i = 0; i < 64; ++i)
+    {
+        TemplateIndexEntry& entry = g_templateIndex[(slot + i) & 0xFFFF];
+        if (entry.object == nullptr || entry.object == object)
+        {
+            entry.object = object;
+            entry.tmpl = tmpl;
+            return;
+        }
+    }
+}
+
+static void* LookupTemplate(void* object)
+{
+    if (object == nullptr) return nullptr;
+    unsigned int slot = (reinterpret_cast<unsigned int>(object) >> 4) & 0xFFFF;
+    for (int i = 0; i < 64; ++i)
+    {
+        TemplateIndexEntry& entry = g_templateIndex[(slot + i) & 0xFFFF];
+        if (entry.object == object) return entry.tmpl;
+        if (entry.object == nullptr) return nullptr;
+    }
+    return nullptr;
+}
+
 static void LookupPlayerTemplate(void* player)
 {
     long count = g_spawnCount;
@@ -607,16 +655,23 @@ static void* FindInventoryTemplateByHash(unsigned int hash)
 // which is how the puppet's behaviours are identified.
 static const char* RttiName(void* object)
 {
-    if (object == nullptr) return nullptr;
+    if (object == nullptr || g_engine == nullptr) return nullptr;
     unsigned int vtable = *(unsigned int*)object;
     if (vtable < 0x10D00000 || vtable > 0x11200000) return nullptr;
+    // The locator, the type descriptor and the decorated name all live in the
+    // engine's data. Anything outside it is a stale object, and following it
+    // would read (and later strstr) arbitrary memory.
+    unsigned int base = reinterpret_cast<unsigned int>(g_engine);
+    unsigned int end = base + 0x1400000;
     unsigned int locator = *(unsigned int*)(reinterpret_cast<unsigned char*>(vtable) - 4);
-    if (!Plausible(reinterpret_cast<void*>(locator))) return nullptr;
+    if (locator < base || locator >= end) return nullptr;
     unsigned int descriptor = ReadU32(reinterpret_cast<void*>(locator), 0x0C);
-    if (!Plausible(reinterpret_cast<void*>(descriptor))) return nullptr;
+    if (descriptor < base || descriptor >= end) return nullptr;
     // The MSVC TypeDescriptor holds the decorated name inline, right after its
     // vftable and spare word.
-    return reinterpret_cast<const char*>(descriptor + 8);
+    unsigned int name = descriptor + 8;
+    if (name < base || name >= end) return nullptr;
+    return reinterpret_cast<const char*>(name);
 }
 
 // Walks the object's behaviour controller (GameObject+0x20) and reports the
@@ -729,6 +784,42 @@ static void DisableCombatBehaviours(void* object)
         return;
     }
     Log("beh: no behaviour list found to disable");
+}
+
+// A city copy only has to draw: every behaviour but the render one is switched
+// off (AI, animation, physics), which is what keeps the clones from running
+// mission code that expects data they do not have.
+static void DisableAllButRender(void* object)
+{
+    if (object == nullptr) return;
+    unsigned char* controller = reinterpret_cast<unsigned char*>(object) + 0x20;
+    for (unsigned int offset = 0; offset <= 0x40; offset += 4)
+    {
+        unsigned int begin = ReadU32(controller, offset);
+        unsigned int end = ReadU32(controller, offset + 4);
+        if (!Plausible(reinterpret_cast<void*>(begin)) || end < begin) continue;
+        unsigned int count = (end - begin) / 4;
+        if (count == 0 || count > 64) continue;
+        bool ownerMatches = true;
+        for (unsigned int i = 0; i < count && ownerMatches; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            if (!Plausible(behaviour) ||
+                (ReadU32(behaviour, 0) != reinterpret_cast<unsigned int>(object) &&
+                 ReadU32(behaviour, 4) != reinterpret_cast<unsigned int>(object)))
+                ownerMatches = false;
+        }
+        if (!ownerMatches) continue;
+        using SetEnabledFn = void (__thiscall*)(void*, bool);
+        for (unsigned int i = 0; i < count; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            const char* name = RttiName(behaviour);
+            if (name != nullptr && strstr(name, "RenderBehaviour") != nullptr) continue;
+            reinterpret_cast<SetEnabledFn>(At<void*>(0x007EEB50))(behaviour, false);
+        }
+        return;
+    }
 }
 
 static void* FindBehaviourByName(void* object, const char* wanted)
@@ -1003,9 +1094,10 @@ static void SpawnPuppet()
         return;
     }
     using SpawnFn = void* (__cdecl*)(void*, const void*, void*, void*, bool);
-    using NameCtorFn = void (__thiscall*)(void*, const char*);
+    // core::Name(const char* text, int) - the engine passes 1 for a new name.
+    using NameCtorFn = void (__thiscall*)(void*, const char*, int);
     unsigned long long objectName = 0;
-    reinterpret_cast<NameCtorFn>(g_nameCtor)(&objectName, "coop_puppet");
+    reinterpret_cast<NameCtorFn>(g_nameCtor)(&objectName, "coop_puppet", 1);
     Log("spawn: object name=%08X%08X", (unsigned int)(objectName >> 32), (unsigned int)objectName);
     void* object = reinterpret_cast<SpawnFn>(g_createObject)(tmpl, &objectName, inventory, nullptr, true);
     Log("spawn: object = %p vtable=%08X", object, object != nullptr ? *(unsigned int*)object : 0);
@@ -2820,11 +2912,18 @@ static void ReplayRemoteTransformations()
         ApplyTransformState(g_remoteSlots, g_remoteSlotCount, true);
 }
 
+static void HandleCitySnapshot(const unsigned char* data, int length);
+
 static void HandlePacket(const unsigned char* data, int length)
 {
     if (length >= 10 && data[0] == 'E' && data[1] == '1')
     {
         SpawnRemoteEffect(data, length);
+        return;
+    }
+    if (length >= 6 && data[0] == 'C' && data[1] == '1')
+    {
+        HandleCitySnapshot(data, length);
         return;
     }
     if (length >= 3 && data[0] == 'M' && data[1] == '1')
@@ -2946,8 +3045,58 @@ static void DumpAnimChanges(void* object, const char* tag)
     Log("anim(%s): changed=%d %s", tag, changed, mask);
 }
 
-// Counts the game objects around the player and groups them by class, to size
-// the city snapshot (how many objects, which kinds, what the walk costs).
+// What an object is, from its behaviours (every object has the same vtable):
+// a character, a vehicle, or a prop.
+enum
+{
+    OBJECT_PROP = 0,
+    OBJECT_CHARACTER = 1,
+    OBJECT_VEHICLE = 2
+};
+
+static int ObjectKind(void* object)
+{
+    if (object == nullptr) return OBJECT_PROP;
+    unsigned char* controller = reinterpret_cast<unsigned char*>(object) + 0x20;
+    for (unsigned int offset = 0; offset <= 0x40; offset += 4)
+    {
+        unsigned int begin = ReadU32(controller, offset);
+        unsigned int end = ReadU32(controller, offset + 4);
+        if (!Plausible(reinterpret_cast<void*>(begin)) || end < begin) continue;
+        unsigned int count = (end - begin) / 4;
+        if (count == 0 || count > 64) continue;
+        bool ownerMatches = true;
+        for (unsigned int i = 0; i < count && ownerMatches; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            if (!Plausible(behaviour) ||
+                (ReadU32(behaviour, 0) != reinterpret_cast<unsigned int>(object) &&
+                 ReadU32(behaviour, 4) != reinterpret_cast<unsigned int>(object)))
+                ownerMatches = false;
+        }
+        if (!ownerMatches) continue;
+        int kind = OBJECT_PROP;
+        for (unsigned int i = 0; i < count; ++i)
+        {
+            void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), i * 4));
+            const char* name = RttiName(behaviour);
+            if (name == nullptr) continue;
+            // Characters carry the motion/intention drivers (NPCs too); the
+            // plain health behaviour is also on destructible props and cars.
+            if (strstr(name, "PrototypeHealthBehaviour") != nullptr ||
+                strstr(name, "CharacterMotionBehaviour") != nullptr ||
+                strstr(name, "CharacterIntentionBehaviour") != nullptr)
+                kind = OBJECT_CHARACTER;
+            else if (kind == OBJECT_PROP && strstr(name, "VehicleBehaviour") != nullptr)
+                kind = OBJECT_VEHICLE;
+        }
+        return kind;
+    }
+    return OBJECT_PROP;
+}
+
+// Counts the game objects around the player, by kind and template, to size the
+// city snapshot and confirm that the templates can be resolved.
 static void CityCensus()
 {
     void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
@@ -2956,18 +3105,23 @@ static void CityCensus()
     unsigned int table = ReadU32(g_engine, 0x128348c);
     if (!Plausible(reinterpret_cast<void*>(table))) return;
     unsigned int started = GetTickCount();
-    struct ClassCount
-    {
-        unsigned int vtable;
-        void* sample;
-        int total;
-        int nearCount;
-    };
-    ClassCount classes[48];
-    int classCount = 0;
     int total = 0;
     int nearCount = 0;
-    int unreadable = 0;
+    int characters = 0;
+    int vehicles = 0;
+    int props = 0;
+    int allChars = 0;
+    int allVeh = 0;
+    int allProps = 0;
+    int selfChars = 0;
+    int withTemplate = 0;
+    struct TemplateCount
+    {
+        unsigned int hash;
+        int count;
+    };
+    TemplateCount templates[32];
+    int templateCount = 0;
     for (unsigned int i = 0; i < 0x1800; ++i)
     {
         void* object = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(table), i * 8));
@@ -2976,33 +3130,47 @@ static void CityCensus()
         if (vtable < 0x10000000 || vtable >= 0x11400000) continue;
         ++total;
         float x = 0.0f, y = 0.0f, z = 0.0f;
-        if (!ReadObjectPosition(object, &x, &y, &z))
+        if (!ReadObjectPosition(object, &x, &y, &z)) continue;
+        float dx = x - px, dy = y - py, dz = z - pz;
+        float radius = static_cast<float>(g_cityRadius);
+        if (dx * dx + dy * dy + dz * dz > radius * radius) continue;
+        int kind = ObjectKind(object);
+        if (kind == OBJECT_CHARACTER) ++allChars;
+        else if (kind == OBJECT_VEHICLE) ++allVeh;
+        else ++allProps;
+        ++nearCount;
+        if (object == player || object == g_puppetObject)
         {
-            ++unreadable;
+            if (kind == OBJECT_CHARACTER) ++selfChars;
             continue;
         }
-        float dx = x - px, dy = y - py, dz = z - pz;
-        bool isNear = dx * dx + dy * dy + dz * dz <= 100.0f * 100.0f;
-        if (isNear) ++nearCount;
-        int index = -1;
-        for (int k = 0; k < classCount; ++k)
+        if (kind == OBJECT_CHARACTER)
         {
-            if (classes[k].vtable != vtable) continue;
-            index = k;
-            break;
+            ++characters;
+            void* tmpl = LookupTemplate(object);
+            unsigned int hash = tmpl != nullptr ? ReadU32(tmpl, 0x10) : 0;
+            if (hash != 0)
+            {
+                ++withTemplate;
+                int found = -1;
+                for (int k = 0; k < templateCount; ++k)
+                    if (templates[k].hash == hash) { found = k; break; }
+                if (found < 0 && templateCount < 32)
+                {
+                    found = templateCount++;
+                    templates[found].hash = hash;
+                    templates[found].count = 0;
+                }
+                if (found >= 0) ++templates[found].count;
+            }
         }
-        if (index < 0 && classCount < 48)
+        else if (kind == OBJECT_VEHICLE)
         {
-            index = classCount++;
-            classes[index].vtable = vtable;
-            classes[index].sample = object;
-            classes[index].total = 0;
-            classes[index].nearCount = 0;
+            ++vehicles;
         }
-        if (index >= 0)
+        else
         {
-            ++classes[index].total;
-            if (isNear) ++classes[index].nearCount;
+            ++props;
         }
     }
     float playerDistance = 0.0f;
@@ -3010,20 +3178,333 @@ static void CityCensus()
         float dx = g_remoteX - px, dy = g_remoteY - py, dz = g_remoteZ - pz;
         playerDistance = sqrtf(dx * dx + dy * dy + dz * dz);
     }
-    Log("city: objects=%d near100=%d unreadable=%d classes=%d ms=%u playerDist=%.1f", total, nearCount, unreadable,
-        classCount, GetTickCount() - started, playerDistance);
-    // The eight classes with the most objects nearby, named by their RTTI.
-    for (int shown = 0; shown < 8; ++shown)
+    Log("city: objects=%d near%d=%d chars=%d veh=%d props=%d tmpl=%d missing=%d ms=%u dist=%.1f", total,
+        g_cityRadius, nearCount, characters, vehicles, props, withTemplate, characters - withTemplate,
+        GetTickCount() - started, playerDistance);
+    // Composition by behaviour markers, one walk per object.
+    int markers[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    static const char* const markerNames[8] = { "PrototypeHealthBehaviour", "HealthBehaviour", "VehicleBehaviour",
+        "CharacterMotionBehaviour", "WalkingBehaviour", "CharacterIntentionBehaviour", "ParkedCar", "AICharacter" };
+    for (unsigned int i = 0; i < 0x1800; ++i)
+    {
+        void* object = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(table), i * 8));
+        if (!Plausible(object) || object == player || object == g_puppetObject) continue;
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        if (!ReadObjectPosition(object, &x, &y, &z)) continue;
+        float dx = x - px, dy = y - py, dz = z - pz;
+        float radius = static_cast<float>(g_cityRadius);
+        if (dx * dx + dy * dy + dz * dz > radius * radius) continue;
+        unsigned char* controller = reinterpret_cast<unsigned char*>(object) + 0x20;
+        for (unsigned int offset = 0; offset <= 0x40; offset += 4)
+        {
+            unsigned int begin = ReadU32(controller, offset);
+            unsigned int end = ReadU32(controller, offset + 4);
+            if (!Plausible(reinterpret_cast<void*>(begin)) || end < begin) continue;
+            unsigned int count = (end - begin) / 4;
+            if (count == 0 || count > 64) continue;
+            bool ownerMatches = true;
+            for (unsigned int k = 0; k < count && ownerMatches; ++k)
+            {
+                void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), k * 4));
+                if (!Plausible(behaviour) ||
+                    (ReadU32(behaviour, 0) != reinterpret_cast<unsigned int>(object) &&
+                     ReadU32(behaviour, 4) != reinterpret_cast<unsigned int>(object)))
+                    ownerMatches = false;
+            }
+            if (!ownerMatches) continue;
+            for (unsigned int k = 0; k < count; ++k)
+            {
+                void* behaviour = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(begin), k * 4));
+                const char* name = RttiName(behaviour);
+                if (name == nullptr) continue;
+                for (int m = 0; m < 8; ++m)
+                    if (strstr(name, markerNames[m]) != nullptr) ++markers[m];
+            }
+            break;
+        }
+    }
+    for (int m = 0; m < 8; ++m)
+        if (markers[m] != 0) Log("city: has %s = %d", markerNames[m], markers[m]);
+    Log("city: all chars=%d veh=%d props=%d self=%d/%d", allChars, allVeh, allProps,
+        ReadObjectPosition(player, &px, &py, &pz) ? ObjectKind(player) : -1,
+        g_puppetObject != nullptr ? ObjectKind(g_puppetObject) : -1);
+    for (int shown = 0; shown < 6; ++shown)
     {
         int best = -1;
-        for (int k = 0; k < classCount; ++k)
-            if (classes[k].nearCount > 0 && (best < 0 || classes[k].nearCount > classes[best].nearCount)) best = k;
+        for (int k = 0; k < templateCount; ++k)
+            if (templates[k].count > 0 && (best < 0 || templates[k].count > templates[best].count)) best = k;
         if (best < 0) break;
-        const char* name = RttiName(classes[best].sample);
-        Log("city: %s near=%d total=%d vtable=%08X", name != nullptr ? name : "(none)", classes[best].nearCount,
-            classes[best].total, classes[best].vtable);
-        classes[best].nearCount = -1;
+        Log("city: tmpl %08X x%d", templates[best].hash, templates[best].count);
+        templates[best].count = 0;
     }
+}
+
+// --- city replication ------------------------------------------------------
+// Each side streams the characters it has around the local player. The peer
+// creates a visual copy from the same template, keeps it in place and drops it
+// when the stream stops. Only active while the two players are close enough for
+// the snapshot to make sense.
+
+enum
+{
+    CITY_MAX = 32,
+    CITY_ENTRY_BYTES = 15
+};
+
+struct CityEntry
+{
+    unsigned int id;
+    unsigned int hash;
+    short qx;
+    short qy;
+    short qz;
+    unsigned char yaw;
+};
+
+struct CityMirror
+{
+    unsigned int id;
+    void* object;
+    unsigned int lastSeen;
+};
+
+static CityMirror g_cityMirrors[CITY_MAX];
+static int g_cityMirrorCount = 0;
+
+static unsigned int ObjectHandleId(void* object)
+{
+    if (object == nullptr) return 0;
+    unsigned short index = *reinterpret_cast<unsigned short*>(reinterpret_cast<unsigned char*>(object) + 0x58);
+    unsigned int table = ReadU32(g_engine, 0x128348c);
+    if (index == 0xFFFF || !Plausible(reinterpret_cast<void*>(table))) return 0;
+    unsigned short serial = *reinterpret_cast<unsigned short*>(
+        reinterpret_cast<unsigned char*>(table) + index * 8 + 4);
+    return (static_cast<unsigned int>(serial) << 16) | index;
+}
+
+// The city stream is only worth its bandwidth while both players are close.
+static bool CityGate()
+{
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    if (player == nullptr || !ReadObjectPosition(player, &x, &y, &z)) return false;
+    float dx = g_remoteX - x, dy = g_remoteY - y, dz = g_remoteZ - z;
+    float distance = sqrtf(dx * dx + dy * dy + dz * dz);
+    bool on = g_cityOn ? distance <= 200.0f : distance < 150.0f;
+    if (on != g_cityOn)
+    {
+        g_cityOn = on;
+        Log("city: gate %s dist=%.1f", on ? "on" : "off", distance);
+    }
+    return g_cityOn;
+}
+
+static int CollectCityEntries(CityEntry* entries, int max)
+{
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+    if (player == nullptr || !ReadObjectPosition(player, &px, &py, &pz)) return 0;
+    unsigned int table = ReadU32(g_engine, 0x128348c);
+    if (!Plausible(reinterpret_cast<void*>(table))) return 0;
+    float radius = static_cast<float>(g_cityRadius);
+    float radius2 = radius * radius;
+    int count = 0;
+    for (unsigned int i = 0; i < 0x1800 && count < max; ++i)
+    {
+        void* object = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(table), i * 8));
+        if (!Plausible(object) || object == player || object == g_puppetObject) continue;
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        if (!ReadObjectPosition(object, &x, &y, &z)) continue;
+        float dx = x - px, dy = y - py, dz = z - pz;
+        if (dx * dx + dy * dy + dz * dz > radius2) continue;
+        if (ObjectKind(object) != OBJECT_CHARACTER) continue;
+        void* tmpl = LookupTemplate(object);
+        if (tmpl == nullptr) continue;
+        unsigned int hash = ReadU32(tmpl, 0x10);
+        if (hash == 0) continue;
+        unsigned int id = ObjectHandleId(object);
+        if (id == 0) continue;
+        CityEntry& entry = entries[count];
+        entry.id = id;
+        entry.hash = hash;
+        entry.qx = static_cast<short>(x * 8.0f);
+        entry.qy = static_cast<short>(y * 8.0f);
+        entry.qz = static_cast<short>(z * 8.0f);
+        entry.yaw = 0;
+        ++count;
+    }
+    return count;
+}
+
+static void SendCitySnapshot()
+{
+    if (g_socket == INVALID_SOCKET) return;
+    CityEntry entries[CITY_MAX];
+    int count = CollectCityEntries(entries, CITY_MAX);
+    if (count <= 0) return;
+    unsigned char packet[6 + CITY_MAX * CITY_ENTRY_BYTES];
+    packet[0] = 'C';
+    packet[1] = '1';
+    unsigned short total = static_cast<unsigned short>(count);
+    memcpy(packet + 2, &total, 2);
+    unsigned short zero = 0;
+    memcpy(packet + 4, &zero, 2);
+    int offset = 6;
+    for (int i = 0; i < count; ++i)
+    {
+        memcpy(packet + offset, &entries[i].id, 4); offset += 4;
+        memcpy(packet + offset, &entries[i].hash, 4); offset += 4;
+        memcpy(packet + offset, &entries[i].qx, 2); offset += 2;
+        memcpy(packet + offset, &entries[i].qy, 2); offset += 2;
+        memcpy(packet + offset, &entries[i].qz, 2); offset += 2;
+        packet[offset++] = entries[i].yaw;
+    }
+    sendto(g_socket, reinterpret_cast<const char*>(packet), offset, 0, reinterpret_cast<sockaddr*>(&g_peer),
+        sizeof(g_peer));
+    ++g_citySendCount;
+    static unsigned int lastLog = 0;
+    unsigned int now = GetTickCount();
+    if (now - lastLog > 8000)
+    {
+        lastLog = now;
+        Log("city: send %d characters (packets=%u recv=%u mirrors=%d spawned=%u missing=%u)", count,
+            g_citySendCount, g_cityRecvCount, g_cityMirrorCount, g_cityMirrorSpawns, g_cityMissingTemplates);
+    }
+}
+
+static CityEntry g_cityEntries[CITY_MAX];
+static int g_cityEntryCount = 0;
+static unsigned char g_cityPacket[512];
+static int g_cityPacketLength = 0;
+static volatile long g_cityPacketReady = 0;
+
+// Called from the receive loop: keep the bytes, do the work on the frame tick.
+static void HandleCitySnapshot(const unsigned char* data, int length)
+{
+    if (length < 6 || length > static_cast<int>(sizeof(g_cityPacket))) return;
+    memcpy(g_cityPacket, data, length);
+    g_cityPacketLength = length;
+    g_cityPacketReady = 1;
+}
+
+// Parsing and spawning live in their own pass over globals, so no pointer or
+// float lives across the engine calls that create the copies.
+static void ProcessCitySnapshot()
+{
+    if (g_cityPacketReady == 0) return;
+    g_cityPacketReady = 0;
+    int length = g_cityPacketLength;
+    if (length < 6) return;
+    unsigned short stated = 0;
+    memcpy(&stated, g_cityPacket + 2, 2);
+    if (stated == 0 || stated > CITY_MAX) return;
+    int available = (length - 6) / CITY_ENTRY_BYTES;
+    if (available <= 0) return;
+    if (stated > available) stated = static_cast<unsigned short>(available);
+    g_cityEntryCount = 0;
+    int offset = 6;
+    for (int i = 0; i < stated; ++i)
+    {
+        CityEntry entry;
+        memcpy(&entry.id, g_cityPacket + offset, 4); offset += 4;
+        memcpy(&entry.hash, g_cityPacket + offset, 4); offset += 4;
+        memcpy(&entry.qx, g_cityPacket + offset, 2); offset += 2;
+        memcpy(&entry.qy, g_cityPacket + offset, 2); offset += 2;
+        memcpy(&entry.qz, g_cityPacket + offset, 2); offset += 2;
+        entry.yaw = g_cityPacket[offset++];
+        if (entry.hash == 0) continue;
+        g_cityEntries[g_cityEntryCount++] = entry;
+    }
+    static bool logged = false;
+    if (!logged && g_cityEntryCount > 0)
+    {
+        logged = true;
+        Log("city: recv len=%d count=%d first id=%08X hash=%08X q=%d,%d,%d", length, g_cityEntryCount,
+            g_cityEntries[0].id, g_cityEntries[0].hash, g_cityEntries[0].qx, g_cityEntries[0].qy,
+            g_cityEntries[0].qz);
+    }
+    unsigned int now = GetTickCount();
+    ++g_cityRecvCount;
+    for (int i = 0; i < g_cityEntryCount; ++i)
+    {
+        unsigned int id = g_cityEntries[i].id;
+        unsigned int hash = g_cityEntries[i].hash;
+        short qx = g_cityEntries[i].qx;
+        short qy = g_cityEntries[i].qy;
+        short qz = g_cityEntries[i].qz;
+        int found = -1;
+        for (int k = 0; k < g_cityMirrorCount; ++k)
+        {
+            if (g_cityMirrors[k].id == id && g_cityMirrors[k].object != nullptr)
+            {
+                found = k;
+                break;
+            }
+        }
+        if (found < 0)
+        {
+            if (g_cityMirrorCount >= CITY_MAX) continue;
+            void* tmpl = FindSpawnedTemplateByHash(hash);
+            if (tmpl == nullptr) tmpl = FindInventoryTemplateByHash(hash);
+            if (tmpl == nullptr)
+            {
+                ++g_cityMissingTemplates;
+                continue;
+            }
+            void* inventory = ReadPtr(g_engine, 0x1283818);
+            if (!Plausible(inventory)) continue;
+            using SpawnFn = void* (__cdecl*)(void*, const void*, void*, void*, bool);
+            // core::Name(const char* text, int) - the engine passes 1 for a new name.
+    using NameCtorFn = void (__thiscall*)(void*, const char*, int);
+            unsigned long long objectName = 0;
+            char objectText[40];
+            sprintf_s(objectText, "coop_city_%u", ++g_cityMirrorSpawns);
+            reinterpret_cast<NameCtorFn>(g_nameCtor)(&objectName, objectText, 1);
+            void* object = reinterpret_cast<SpawnFn>(g_createObject)(tmpl, &objectName, inventory, nullptr, true);
+            if (object == nullptr) continue;
+            SetObjectPosition(object, qx / 8.0f, qy / 8.0f, qz / 8.0f);
+            DisableAllButRender(object);
+            ClearAttributeByVtable(object, 0x10D9653C);
+            Log("city: mirror %p tmpl=%08X id=%08X q=%d,%d,%d", object, hash, id, qx, qy, qz);
+            // Reuse the slot of an expired copy before growing the table.
+            found = -1;
+            for (int k = 0; k < g_cityMirrorCount; ++k)
+                if (g_cityMirrors[k].object == nullptr) { found = k; break; }
+            if (found < 0)
+            {
+                found = g_cityMirrorCount++;
+            }
+            g_cityMirrors[found].id = id;
+            g_cityMirrors[found].object = object;
+        }
+        g_cityMirrors[found].lastSeen = now;
+        SetObjectPosition(g_cityMirrors[found].object, qx / 8.0f, qy / 8.0f, qz / 8.0f);
+    }
+}
+
+// Mirrors that stop arriving are moved out of sight and their slot is reused.
+static void ExpireCityMirrors()
+{
+    unsigned int now = GetTickCount();
+    for (int k = 0; k < g_cityMirrorCount; ++k)
+    {
+        if (g_cityMirrors[k].object == nullptr) continue;
+        if (now - g_cityMirrors[k].lastSeen <= 4000) continue;
+        SetObjectPosition(g_cityMirrors[k].object, 0.0f, -5000.0f, 0.0f);
+        Log("city: mirror %p expired", g_cityMirrors[k].object);
+        g_cityMirrors[k].object = nullptr;
+        g_cityMirrors[k].id = 0;
+    }
+}
+
+static void CityTick()
+{
+    // Copies keep ageing even while the gate is closed, so a separation does not
+    // leave frozen actors behind.
+    ProcessCitySnapshot();
+    if ((g_updateCalls % 60) == 0) ExpireCityMirrors();
+    if (!CityGate()) return;
+    if ((g_updateCalls % 15) == 0) SendCitySnapshot();
 }
 
 static void FrameTick()
@@ -3043,6 +3524,7 @@ static void FrameTick()
         LoadLuaPowerCatalogIfReady();
     ApplyModel();
     if (g_cityCensus && localPlayer != nullptr && (g_updateCalls % 120) == 0) CityCensus();
+    CityTick();
     PreloadTick();
     if (g_dumpAnim && (g_updateCalls % 15) == 0)
     {
@@ -3499,6 +3981,7 @@ static void* __attribute__((force_align_arg_pointer)) __cdecl HookCreateSpawned(
         g_spawns[index].object = object;
         g_spawns[index].tmpl = tmpl;
     }
+    IndexTemplate(object, tmpl);
     if (index < 60)
         Log("spawned[%ld] tmpl=%p name=%08X%08X object=%p vtable=%08X", index, tmpl,
             name != nullptr ? *(const unsigned int*)((const unsigned char*)name + 4) : 0,
