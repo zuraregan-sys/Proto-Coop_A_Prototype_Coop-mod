@@ -1279,6 +1279,22 @@ static void ApplyModel()
     void* render = FindBehaviourByName(g_puppetObject, "RenderBehaviour");
     if (render == nullptr) return;
     unsigned int hash = ReadU32(g_remoteModel, 0);
+    // WhipFist's model is the whip arm itself, not a full body variant: binding
+    // it on the puppet with the streamed pose stretches the whole character.
+    // Its visible part is the tendril (a motion trail, not replicated yet), so
+    // keep the puppet's current model instead of breaking it.
+    if (hash == 0x5E358819)
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            Log("model: skipping WhipFist model (arm only)");
+        }
+        memcpy(g_appliedModel, g_remoteModel, 8);
+        g_appliedModelValid = true;
+        return;
+    }
     // No swap needed when the puppet already wears that model (the two games
     // give the same name different registry indexes, so compare the hash).
     if (!g_forceSwap && ReadU32(render, 0x18) == hash)
