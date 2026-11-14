@@ -1216,118 +1216,6 @@ static void* FindDrawableArchetype(unsigned int hash)
     return nullptr;
 }
 
-// A full inventory walk is far too slow for one frame (hundreds of thousands of
-// dynamic casts), so the model lookup runs a few thousand objects per tick and
-// answers as soon as it reaches the archetype.
-static void* g_modelInventories[160];
-static int g_modelInventoryCount = 0;
-static unsigned int g_modelScanInventory = 0;
-static unsigned int g_modelScanObject = 0;
-static unsigned int g_modelScanHash = 0;
-static bool g_modelScanDone = false;
-static void* g_modelFound = nullptr;
-
-static void ModelResetScan(unsigned int hash)
-{
-    g_modelScanHash = hash;
-    g_modelScanInventory = 0;
-    g_modelScanObject = 0;
-    g_modelInventoryCount = 0;
-    g_modelScanDone = false;
-    g_modelFound = nullptr;
-}
-
-static void ModelScanStep(int budget)
-{
-    if (g_modelScanDone) return;
-    if (g_modelInventoryCount == 0)
-    {
-        void* root = ReadPtr(g_engine, 0x1283818);
-        if (!Plausible(root)) return;
-        g_modelInventories[g_modelInventoryCount++] = root;
-    }
-    using CastFn = void* (__thiscall*)(void*, void*);
-    CastFn cast = *reinterpret_cast<CastFn*>(g_drawableArchetypeCaster);
-    struct Caster { void* vtable; };
-    Caster caster;
-    caster.vtable = g_drawableArchetypeCaster;
-    using GetNameFn = const void* (__thiscall*)(void*);
-    GetNameFn getName = reinterpret_cast<GetNameFn>(g_archetypeGetName);
-    unsigned int rootVtable = ReadU32(g_modelInventories[0], 0);
-
-    while (g_modelScanInventory < static_cast<unsigned int>(g_modelInventoryCount) && budget > 0)
-    {
-        void* inventory = g_modelInventories[g_modelScanInventory];
-        void* table = ReadPtr(inventory, 0x0C);
-        if (!Plausible(table))
-        {
-            ++g_modelScanInventory;
-            g_modelScanObject = 0;
-            continue;
-        }
-        unsigned int count = ReadU32(table, 0);
-        void** objects = reinterpret_cast<void**>(ReadPtr(table, 0x1C));
-        if (!Plausible(objects) || count > 20000)
-        {
-            ++g_modelScanInventory;
-            g_modelScanObject = 0;
-            continue;
-        }
-        while (g_modelScanObject < count && budget > 0)
-        {
-            void* object = objects[g_modelScanObject++];
-            --budget;
-            if (!Plausible(object)) continue;
-            unsigned int vtable = ReadU32(object, 0);
-            if (vtable == rootVtable)
-            {
-                bool seen = false;
-                for (int k = 0; k < g_modelInventoryCount; ++k)
-                    if (g_modelInventories[k] == object) { seen = true; break; }
-                if (!seen && g_modelInventoryCount < 160)
-                    g_modelInventories[g_modelInventoryCount++] = object;
-                continue;
-            }
-            if (vtable < 0x10D00000 || vtable > 0x11200000) continue;
-            if (!Plausible(reinterpret_cast<void*>(vtable - 4)) ||
-                !Plausible(reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(vtable - 4), 0))))
-                continue;
-            void* archetype = cast(&caster, object);
-            if (archetype == nullptr) continue;
-            const void* name = getName(archetype);
-            if (name == nullptr) continue;
-            if (ReadU32(const_cast<void*>(name), 0) != g_modelScanHash) continue;
-            g_modelFound = archetype;
-            g_modelScanDone = true;
-            return;
-        }
-        if (g_modelScanObject >= count)
-        {
-            ++g_modelScanInventory;
-            g_modelScanObject = 0;
-        }
-    }
-    if (g_modelScanInventory >= static_cast<unsigned int>(g_modelInventoryCount))
-        g_modelScanDone = true;
-}
-
-// The second word of a core::Name is the per-process registry index, so only the
-// hash is comparable between the two games.
-static void* ModelArchetype(unsigned int hash)
-{
-    if (g_modelScanHash != hash) ModelResetScan(hash);
-    if (g_modelFound != nullptr)
-    {
-        if (ReadU32(g_modelFound, 0) == 0x10E6E394) return g_modelFound;
-        ModelResetScan(hash);
-        return nullptr;
-    }
-    if (g_modelScanDone) return nullptr;
-    ModelScanStep(4000);
-    if (g_modelFound != nullptr && ReadU32(g_modelFound, 0) == 0x10E6E394) return g_modelFound;
-    return nullptr;
-}
-
 // The game swaps the character model when a power is equipped: the
 // RenderBehaviour's drawable archetype name changes to the power's model, and
 // the TransformationDescription carries that same name at +0x18. The puppet is
@@ -1359,6 +1247,41 @@ static void SendModel()
     Log("model send: %08X%08X", (unsigned int)(value >> 32), (unsigned int)value);
 }
 
+// Swaps the character model of an object for the archetype of that name hash,
+// keeping the pose it already has (the one the stream writes for the puppet and
+// the one the game animates for the player).
+static void SetObjectModel(void* object, unsigned int hash)
+{
+    if (object == nullptr || hash == 0) return;
+    void* render = FindBehaviourByName(object, "RenderBehaviour");
+    if (render == nullptr) return;
+    if (ReadU32(render, 0x18) == hash) return;
+    void* archetype = FindDrawableArchetype(hash);
+    if (archetype == nullptr) return;
+    unsigned int sourceDrawable = ReadU32(archetype, 8);
+    if (ReadU32(archetype, 0) != 0x10E6E394 || !Plausible(reinterpret_cast<void*>(sourceDrawable))) return;
+    unsigned int poseAttribute = ReadU32(render, 0xC);
+    using CreateInstanceFn = void (__cdecl*)(void*, void*, unsigned char, unsigned char);
+    unsigned char created[16] = { 0 };
+    reinterpret_cast<CreateInstanceFn>(At<void*>(0x007ED5F0))(created, archetype, 1,
+        poseAttribute != 0 ? 1 : 0);
+    unsigned int handle = *(unsigned int*)created;
+    if (handle == 0xFFFFFFFF) return;
+    const void* localName = reinterpret_cast<const void* (__thiscall*)(void*)>(At<void*>(0x008258B0))(archetype);
+    unsigned int oldPose = GetAttributeValue(object, 0x10E80688);
+    reinterpret_cast<void (__thiscall*)(void*, unsigned int, const void*)>(At<void*>(0x00862C30))(
+        render, handle, localName != nullptr ? localName : g_remoteModel);
+    if (oldPose != 0 && Plausible(reinterpret_cast<void*>(oldPose)) &&
+        ReadU32(reinterpret_cast<void*>(oldPose), 0x14) == 67)
+    {
+        reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006E2A70))(reinterpret_cast<void*>(oldPose));
+        reinterpret_cast<void (__thiscall*)(void*, void*)>(At<void*>(0x00862600))(render, reinterpret_cast<void*>(oldPose));
+        reinterpret_cast<void (__thiscall*)(const void*, void*)>(At<void*>(0x007EDA80))(
+            reinterpret_cast<const void*>(&handle), reinterpret_cast<void*>(oldPose));
+        reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006E2A80))(reinterpret_cast<void*>(oldPose));
+    }
+}
+
 static void ApplyModel()
 {
     if (!g_syncModel || !g_remoteModelValid) return;
@@ -1381,23 +1304,16 @@ static void ApplyModel()
         g_appliedModelValid = true;
         return;
     }
-    void* archetype = ModelArchetype(hash);
+    // A missing model costs a full inventory walk, so retry it slowly.
+    static unsigned int missHash = 0;
+    static unsigned int missTick = 0;
+    if (hash == missHash && now - missTick < 5000) return;
+    void* archetype = FindDrawableArchetype(hash);
     if (archetype == nullptr)
     {
-        static unsigned int lastMissing = 0;
-        static unsigned int lastRescan = 0;
-        // The model may be loaded later (when this game's own player equips the
-        // same power), so walk the inventories again every few seconds.
-        if (g_modelScanDone && now - lastRescan > 3000)
-        {
-            lastRescan = now;
-            ModelResetScan(hash);
-        }
-        if (lastMissing != hash && g_modelScanDone)
-        {
-            lastMissing = hash;
-            Log("model: %08X not loaded here", hash);
-        }
+        missHash = hash;
+        missTick = now;
+        Log("model: %08X not loaded here", hash);
         return;
     }
     unsigned int sourceDrawable = ReadU32(archetype, 8);
@@ -1987,6 +1903,7 @@ static void PreloadTick()
     static int holdTries = 0;
     static bool saved = false;
     static unsigned int savedDesired = 0;
+    static unsigned int savedModel = 0;
     static bool finished = false;
     static const unsigned int huds[5] = { 1, 2, 3, 4, 5 };
     unsigned int now = GetTickCount();
@@ -2006,6 +1923,8 @@ static void PreloadTick()
     {
         saved = true;
         savedDesired = ReadU32(reinterpret_cast<void*>(slots), 0x08);
+        void* render = FindBehaviourByName(player, "RenderBehaviour");
+        savedModel = render != nullptr ? ReadU32(render, 0x18) : 0;
     }
 
     // Keep a reference to the model of the power started in the previous step
@@ -2055,8 +1974,13 @@ static void PreloadTick()
             restore, slotName, restoreName, false);
         reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(player, restore);
         *reinterpret_cast<unsigned int*>(slots + 0x08) = savedDesired;
-        Log("preload: restored desired=%08X (saved %08X)", ReadU32(reinterpret_cast<void*>(slots), 0x08),
-            savedDesired);
+        // Setting the desired description also changed the character model:
+        // put the player's own model back before anything is replicated.
+        SetObjectModel(player, savedModel);
+        Log("preload: restored desired=%08X model=%08X (saved %08X/%08X)",
+            ReadU32(reinterpret_cast<void*>(slots), 0x08),
+            ReadU32(reinterpret_cast<void*>(FindBehaviourByName(player, "RenderBehaviour")), 0x18),
+            savedDesired, savedModel);
         for (int k = 0; k < 5; ++k)
         {
             unsigned int found = 0;
@@ -2071,6 +1995,9 @@ static void PreloadTick()
             Log("preload: model %08X loaded=%d", model, FindDrawableArchetype(model) != nullptr ? 1 : 0);
         }
         finished = true;
+        // The remote model may have arrived while the preload was still running:
+        // make the next tick reapply it now that every model is available.
+        g_appliedModelValid = false;
         Log("preload: done");
         return;
     }
@@ -2367,7 +2294,6 @@ static void ResetCoopState()
     g_remoteBasisValid = false;
     g_lastAppliedSlotCount = 0;
     g_appliedModelValid = false;
-    ModelResetScan(0);
     g_attrDumped = false;
     g_puppetPlaced = false;
     // Keep the spawn records: the new player object was already recorded by the
