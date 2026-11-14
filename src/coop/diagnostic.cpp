@@ -1156,7 +1156,17 @@ static void* FindDrawableArchetype(unsigned int hash)
     static void* cachedArchetypes[64];
     static int cachedCount = 0;
     for (int i = 0; i < cachedCount; ++i)
-        if (cachedHashes[i] == hash) return cachedArchetypes[i];
+    {
+        if (cachedHashes[i] != hash) continue;
+        void* cached = cachedArchetypes[i];
+        // The streaming can unload an archetype and reload it elsewhere: a
+        // stale pointer would silently break every later model swap.
+        if (cached != nullptr && ReadU32(cached, 0) == 0x10E6E394)
+            return cached;
+        cachedArchetypes[i] = nullptr;
+        cachedHashes[i] = 0;
+        break;
+    }
 
     void* root = ReadPtr(g_engine, 0x1283818);
     if (!Plausible(root)) return nullptr;
@@ -1292,7 +1302,11 @@ static void ApplyModel()
     unsigned int sourceDrawable = ReadU32(archetype, 8);
     if (ReadU32(archetype, 0) != 0x10E6E394 || !Plausible(reinterpret_cast<void*>(sourceDrawable)) ||
         !Plausible(reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(sourceDrawable), 0xA4))))
+    {
+        Log("model: archetype %08X unusable (vtable=%08X drawable=%08X)", hash,
+            ReadU32(archetype, 0), sourceDrawable);
         return;
+    }
     // Build the drawable the way the engine's drawable message does: instance
     // the archetype, publish it on the render behaviour and take the pose from
     // the render-side handle. SetSource instead crashes in
