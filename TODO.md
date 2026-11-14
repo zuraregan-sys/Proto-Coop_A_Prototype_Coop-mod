@@ -39,9 +39,9 @@ del snapshot, sin cuelgues ni crashes.
 - [x] 9. Evitar duplicados: no se envia ningun actor a menos de `city_near` (60 m)
       del peer; en la zona comun no hay copias dobles. Verificado: con los dos
       jugadores juntos se envian solo 2-10 actores lejanos en vez de 24.
-- [x] 10. Vehiculos: implementados, pero **desactivados** (`city_vehicles=0`):
-      clonar sus plantillas revienta en `ConstraintAngularVelocity::SetAxis`
-      (constraint fisico nulo). Queda para una representacion solo-drawable.
+- [x] 10. Vehiculos: replicados por categoria. El peer usa su propia plantilla
+      de vehiculo; los militares caen a vehiculo normal (clonar un tanque
+      revienta en la fisica).
 - [x] 11. Save compartido para dos PCs: `tools/sync-save.ps1` copia los
       `slot-*.bin` del host al cliente con verificacion de hash y respaldo.
 
@@ -51,8 +51,8 @@ del snapshot, sin cuelgues ni crashes.
       cercanos); aplicar la pose revienta en el motor (`Pose::Update` -> call
       nulo y `Drawable::GetSkeleton` con drawables muertos). Queda tras
       `city_pose=0` hasta encontrar una via segura.
-- [ ] Vehiculos/tanques en ambos lados: necesitan copias solo-drawable (clonar
-      el GameObject revienta en la fisica).
+- [ ] Tanques/militares con su propia plantilla en el peer: clonar un tanque
+      revienta en la fisica; hoy se sustituyen por un vehiculo normal.
 - [ ] Latigo en el actor remoto y su tendril (el contenido no admite dos actores).
 - [ ] Efectos anclados y motion trails.
 - [ ] Disfraz.

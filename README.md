@@ -44,22 +44,25 @@ Overall                                ############--------  61%
 
 ### City replication
 
-While the two players are within 150 m of each other (the stream stops at 200 m),
-each side sends the characters and a few vehicles it has within `city_radius`
-(32 entries at most, 4 Hz) as `C1` packets: sender id, template hash, quantized
-position and facing. The peer resolves the template by hash in its own content and
-spawns a visual copy with every behaviour except the render one switched off, so
-it cannot fight, move on its own or run mission code. Copies that stop arriving
-are moved out of sight and their slot is reused.
+The host does not replicate actors, only **positions and a category**. Each
+snapshot (`C2`, 4 Hz, up to 32 entries) carries, per actor, its id, a category
+(civilian, soldier, infected, mutant, vehicle, military vehicle) and a quantized
+position. The peer puts **its own** actor of that category at the position: any
+soldier for a soldier, any car for a taxi, any infected for a zombie. Nothing
+about animation, physics, facing or the exact model crosses the network.
 
-Both sides stream their nearest characters, so each window shows the union of the
-two cities (the same set of characters on both). The copies are static for now:
-driving their pose faults in the engine, so the stream stays behind `city_pose=0`.
-Vehicles are **not** mirrored (`city_vehicles=0`): duplicating their templates
-faults inside the physics setup (`ConstraintAngularVelocity::SetAxis`), so tanks
-and cars still differ between the two windows.
+The representative template of each category is learned from the peer's own
+world (it is cached from the first actor of that category it sees, anywhere in
+the level), with a fallback chain: a mutant falls back to an infected, an
+infected to a civilian/soldier, a soldier to a civilian, and a military vehicle
+to a normal vehicle. Military vehicles are not spawned from a tank template
+because the physics setup of a duplicated tank faults in the engine.
 
-## How it works right now (for testing)
+The stream is gated by the distance between players (on below 150 m, off above
+200 m) and the copies are static. Both windows therefore show the same actors in
+the same places, in the same broad categories.
+
+## How it works right now## How it works right now (for testing)
 
 Two instances of the game run side by side, each with the plugin. Each instance keeps a
 local **puppet**: a copy of the player template spawned into the same map, whose pose is
@@ -110,11 +113,12 @@ sync_model=0         ; legacy archetype swap (unused while lua_powers=1)
 dump_lua=0           ; 1 = log the power catalog, HUD writes and every Lua call
 whip_puppet=0        ; 1 = also apply the whip to the puppet (crashes: engine limit)
 puppet_nochoreo=1    ; 1 = keep the avatar out of the engine's animation jobs (default)
-city_radius=300      ; stream the characters around each player within this radius
+city_radius=300      ; stream the actors around each player within this radius
 city_census=0        ; 1 = log the city composition around the player every 2 s
-city_near=60         ; reserved for the duplicate filter (not used by default)
-city_vehicles=0      ; 1 = also mirror vehicles (faults in the engine)
-city_pose=0          ; 1 = stream the nearest copies' poses (faults in the engine)
+city_near=60         ; reserved (the category stream does not filter by it)
+city_vehicles=1      ; also replicate vehicles (its own local template)
+city_pose=0          ; reserved (driving the copies' poses faults in the engine)
+city_dump=1          ; 1 = log template/behaviour of the actors around the player
 ```
 
 ## Building
