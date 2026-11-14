@@ -71,6 +71,12 @@ combat/threat/physics ones so it cannot hurt or push anyone, and the motion driv
 (`CharacterMotionBehaviour`, `MotionTreeBehaviour`, `MotionStateBehaviour`, `IKBehaviour`)
 so they cannot overwrite the streamed pose.
 
+The avatar is also removed from the engine's animation system (`choreo::Puppet`): the pose
+that arrives over the network is the only animator. Keeping the clone in the animation job
+queue eventually deadlocked `choreo::RunPuppetJobs` (the game thread waited forever on a
+job) after a few minutes of free roam; without it the avatar still animates, transforms and
+runs for a whole session.
+
 ## Configuration
 
 `coop.ini` next to the game executable:
@@ -85,6 +91,7 @@ lua_powers=1         ; apply powers through the game's own Lua transformation he
 sync_model=0         ; legacy archetype swap (unused while lua_powers=1)
 dump_lua=0           ; 1 = log the power catalog, HUD writes and every Lua call
 whip_puppet=0        ; 1 = also apply the whip to the puppet (crashes: engine limit)
+puppet_nochoreo=1    ; 1 = keep the avatar out of the engine's animation jobs (default)
 ```
 
 ## Building

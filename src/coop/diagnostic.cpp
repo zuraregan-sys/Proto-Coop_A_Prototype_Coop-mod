@@ -2,6 +2,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -60,6 +61,7 @@ static void SpawnRemoteMotionTrail(const unsigned char* data, int length);
 static volatile long g_tickCount = 0;
 static volatile long g_phase = 0;
 static DWORD WINAPI WatchdogThread(LPVOID);
+static DWORD g_mainThreadId = 0;
 static bool Plausible(const void* pointer);
 static unsigned int ReadU32(const void* base, unsigned int offset);
 static unsigned int GetAttributeValue(void* object, unsigned int vtable);
@@ -96,6 +98,8 @@ static bool g_luaPowers = true;
 static bool g_dumpLua = false;
 static void* g_dbSetInt = nullptr;
 static bool g_whipPuppet = false;
+static bool g_puppetNoChoreo = true;
+static bool g_cityCensus = false;
 static volatile long g_luaWindowUntil = 0;
 static bool g_forceSwap = false;
 static bool g_transformStart = false;
@@ -217,6 +221,8 @@ static void ReadConfig()
     g_dumpMotion = GetPrivateProfileIntA("coop", "dump_motion", 0, path) != 0;
     g_syncTrails = GetPrivateProfileIntA("coop", "sync_trails", 0, path) != 0;
     g_whipPuppet = GetPrivateProfileIntA("coop", "whip_puppet", 0, path) != 0;
+    g_puppetNoChoreo = GetPrivateProfileIntA("coop", "puppet_nochoreo", 1, path) != 0;
+    g_cityCensus = GetPrivateProfileIntA("coop", "city_census", 0, path) != 0;
     g_luaPowers = GetPrivateProfileIntA("coop", "lua_powers", 1, path) != 0;
     g_dumpLua = GetPrivateProfileIntA("coop", "dump_lua", 0, path) != 0;
     g_forceSwap = GetPrivateProfileIntA("coop", "force_swap", 0, path) != 0;
@@ -1044,6 +1050,15 @@ static void SpawnPuppet()
     else
     {
         DisableCombatBehaviours(object);
+        if (g_puppetNoChoreo)
+        {
+            // The clone's choreo puppet joins the engine's animation jobs; its
+            // cloned drivers eventually leave a job unfinished and the game
+            // thread waits forever in choreo::RunPuppetJobs. The streamed pose
+            // already animates the avatar, so the choreo puppet is removed.
+            ClearAttributeByVtable(object, 0x10D9653C);
+            Log("spawn: puppet has no choreo puppet (pose stream only)");
+        }
         Log("transform: puppet behaviour=%p player behaviour=%p",
             FindBehaviourByName(object, "TransformationBehaviour"),
             FindBehaviourByName(playerObject, "TransformationBehaviour"));
@@ -1086,8 +1101,9 @@ static void SpawnPuppet()
                     words[5], words[6]);
             }
         }
-        ClonePuppetDrivers(reinterpret_cast<void*>(GetAttributeValue(object, 0x10D9653C)),
-            reinterpret_cast<void*>(GetAttributeValue(playerObject, 0x10D9653C)));
+        if (!g_puppetNoChoreo)
+            ClonePuppetDrivers(reinterpret_cast<void*>(GetAttributeValue(object, 0x10D9653C)),
+                reinterpret_cast<void*>(GetAttributeValue(playerObject, 0x10D9653C)));
     }
     void* player1 = g_getPlayerObject ? g_getPlayerObject(1) : nullptr;
     Log("spawn: index=%u gen=%u handle=%08X p1=%p at %.1f %.1f %.1f", objectIndex, generation, handle,
@@ -1597,6 +1613,93 @@ static void InstallCrtHandler()
     }
 }
 
+// Reads the stack of the game thread while it is not advancing and records the
+// code addresses on it, so a stall can be told apart from a long engine task.
+static void DumpStalledThread(DWORD threadId)
+{
+    HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, threadId);
+    if (thread == nullptr) return;
+    if (SuspendThread(thread) == static_cast<DWORD>(-1))
+    {
+        CloseHandle(thread);
+        return;
+    }
+    char header[256];
+    char text[720];
+    int used = 0;
+    text[0] = 0;
+    CONTEXT context;
+    memset(&context, 0, sizeof(context));
+    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    if (GetThreadContext(thread, &context))
+    {
+        sprintf_s(header, sizeof(header),
+            "watchdog: main eip=%08X esp=%08X ebp=%08X eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X edi=%08X",
+            context.Eip, context.Esp, context.Ebp, context.Eax, context.Ebx, context.Ecx, context.Edx,
+            context.Esi, context.Edi);
+        unsigned int base = reinterpret_cast<unsigned int>(g_engine);
+        unsigned int esp = context.Esp;
+        unsigned int end = esp + 0x400;
+        MEMORY_BASIC_INFORMATION region;
+        if (VirtualQuery(reinterpret_cast<void*>(esp), &region, sizeof(region)) != 0 &&
+            region.State == MEM_COMMIT)
+        {
+            unsigned int regionEnd = reinterpret_cast<unsigned int>(region.BaseAddress) + region.RegionSize;
+            if (regionEnd < end) end = regionEnd;
+        }
+        else
+        {
+            end = esp;
+        }
+        for (unsigned int p = esp; p + 4 <= end && used < 560; p += 4)
+        {
+            unsigned int value = *reinterpret_cast<unsigned int*>(p);
+            if (value < base || value >= base + 0x2000000) continue;
+            int added = sprintf_s(text + used, sizeof(text) - used, " %06X", value - base);
+            if (added <= 0) break;
+            used += added;
+        }
+    }
+    else
+    {
+        strcpy_s(header, sizeof(header), "watchdog: main context unavailable");
+    }
+    ResumeThread(thread);
+    CloseHandle(thread);
+    Log("%s", header);
+    if (used > 0) Log("watchdog: stack%s", text);
+}
+
+// Every thread of the process with the address it is executing.
+static void DumpThreads()
+{
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry;
+    entry.dwSize = sizeof(entry);
+    if (Thread32First(snapshot, &entry))
+    {
+        do
+        {
+            if (entry.th32OwnerProcessID != GetCurrentProcessId()) continue;
+            HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, entry.th32ThreadID);
+            if (thread == nullptr) continue;
+            if (SuspendThread(thread) != static_cast<DWORD>(-1))
+            {
+                CONTEXT context;
+                memset(&context, 0, sizeof(context));
+                context.ContextFlags = CONTEXT_CONTROL;
+                if (GetThreadContext(thread, &context))
+                    Log("watchdog: thread %u eip=%08X esp=%08X ebp=%08X%s", entry.th32ThreadID, context.Eip,
+                        context.Esp, context.Ebp, entry.th32ThreadID == g_mainThreadId ? " (main)" : "");
+                ResumeThread(thread);
+            }
+            CloseHandle(thread);
+        } while (Thread32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+}
+
 static DWORD WINAPI WatchdogThread(LPVOID)
 {
     long last = -1;
@@ -1609,6 +1712,8 @@ static DWORD WINAPI WatchdogThread(LPVOID)
         {
             Log("watchdog: stalled at phase %ld (tick %ld)", g_phase, current);
             lastStall = current;
+            if (g_mainThreadId != 0) DumpStalledThread(g_mainThreadId);
+            DumpThreads();
         }
         last = current;
     }
@@ -2841,6 +2946,86 @@ static void DumpAnimChanges(void* object, const char* tag)
     Log("anim(%s): changed=%d %s", tag, changed, mask);
 }
 
+// Counts the game objects around the player and groups them by class, to size
+// the city snapshot (how many objects, which kinds, what the walk costs).
+static void CityCensus()
+{
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+    if (player == nullptr || !ReadObjectPosition(player, &px, &py, &pz)) return;
+    unsigned int table = ReadU32(g_engine, 0x128348c);
+    if (!Plausible(reinterpret_cast<void*>(table))) return;
+    unsigned int started = GetTickCount();
+    struct ClassCount
+    {
+        unsigned int vtable;
+        void* sample;
+        int total;
+        int nearCount;
+    };
+    ClassCount classes[48];
+    int classCount = 0;
+    int total = 0;
+    int nearCount = 0;
+    int unreadable = 0;
+    for (unsigned int i = 0; i < 0x1800; ++i)
+    {
+        void* object = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(table), i * 8));
+        if (!Plausible(object)) continue;
+        unsigned int vtable = ReadU32(object, 0);
+        if (vtable < 0x10000000 || vtable >= 0x11400000) continue;
+        ++total;
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        if (!ReadObjectPosition(object, &x, &y, &z))
+        {
+            ++unreadable;
+            continue;
+        }
+        float dx = x - px, dy = y - py, dz = z - pz;
+        bool isNear = dx * dx + dy * dy + dz * dz <= 100.0f * 100.0f;
+        if (isNear) ++nearCount;
+        int index = -1;
+        for (int k = 0; k < classCount; ++k)
+        {
+            if (classes[k].vtable != vtable) continue;
+            index = k;
+            break;
+        }
+        if (index < 0 && classCount < 48)
+        {
+            index = classCount++;
+            classes[index].vtable = vtable;
+            classes[index].sample = object;
+            classes[index].total = 0;
+            classes[index].nearCount = 0;
+        }
+        if (index >= 0)
+        {
+            ++classes[index].total;
+            if (isNear) ++classes[index].nearCount;
+        }
+    }
+    float playerDistance = 0.0f;
+    {
+        float dx = g_remoteX - px, dy = g_remoteY - py, dz = g_remoteZ - pz;
+        playerDistance = sqrtf(dx * dx + dy * dy + dz * dz);
+    }
+    Log("city: objects=%d near100=%d unreadable=%d classes=%d ms=%u playerDist=%.1f", total, nearCount, unreadable,
+        classCount, GetTickCount() - started, playerDistance);
+    // The eight classes with the most objects nearby, named by their RTTI.
+    for (int shown = 0; shown < 8; ++shown)
+    {
+        int best = -1;
+        for (int k = 0; k < classCount; ++k)
+            if (classes[k].nearCount > 0 && (best < 0 || classes[k].nearCount > classes[best].nearCount)) best = k;
+        if (best < 0) break;
+        const char* name = RttiName(classes[best].sample);
+        Log("city: %s near=%d total=%d vtable=%08X", name != nullptr ? name : "(none)", classes[best].nearCount,
+            classes[best].total, classes[best].vtable);
+        classes[best].nearCount = -1;
+    }
+}
+
 static void FrameTick()
 {
     // Both tick sources (engine sync and the controller) may fire in one frame.
@@ -2857,6 +3042,7 @@ static void FrameTick()
     if ((g_luaPowers || g_dumpLua) && !g_luaCatalogLoaded && localPlayer != nullptr)
         LoadLuaPowerCatalogIfReady();
     ApplyModel();
+    if (g_cityCensus && localPlayer != nullptr && (g_updateCalls % 120) == 0) CityCensus();
     PreloadTick();
     if (g_dumpAnim && (g_updateCalls % 15) == 0)
     {
@@ -3354,6 +3540,7 @@ static void InstallHooks()
     }
 
     InstallCrashLog();
+    g_mainThreadId = GetCurrentThreadId();
     CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
     InstallCrtHandler();
     Install("ChannelManager::Open", At<void*>(0x008C31D0), (void*)&HookOpen, (void**)&g_open);
