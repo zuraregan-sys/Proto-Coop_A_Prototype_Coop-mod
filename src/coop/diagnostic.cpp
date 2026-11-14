@@ -1252,7 +1252,14 @@ static void ApplyModel()
 {
     if (!g_syncModel || !g_remoteModelValid) return;
     if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
-    if (g_appliedModelValid && memcmp(g_remoteModel, g_appliedModel, 8) == 0) return;
+    if (g_appliedModelValid && memcmp(g_remoteModel, g_appliedModel, 8) == 0)
+    {
+        // The game can reset the puppet's model (a respawn, a transformation
+        // slot change): put it back when the drawable no longer matches.
+        void* current = FindBehaviourByName(g_puppetObject, "RenderBehaviour");
+        if (current != nullptr && ReadU32(current, 0x18) == ReadU32(g_remoteModel, 0))
+            return;
+    }
     // The model may not be loaded in this game yet (it only loads the archetypes
     // its own player uses), so retry at a low rate until it appears.
     static unsigned int lastAttempt = 0;
