@@ -190,6 +190,9 @@ namespace
         if (pid != GetCurrentProcessId()) return TRUE;
         if (!IsWindowVisible(hwnd)) return TRUE;
         if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+        char cls[64] = { 0 };
+        GetClassNameA(hwnd, cls, sizeof(cls));
+        if (strcmp(cls, "ProtoCoopLobby") == 0) return TRUE;
         g_window = hwnd;
         return FALSE;
     }

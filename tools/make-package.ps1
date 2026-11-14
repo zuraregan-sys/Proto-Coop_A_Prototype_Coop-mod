@@ -71,14 +71,14 @@ Conectar por Steam (recomendado)
 --------------------------------
 1. Los dos tenéis Steam abierto y este mismo mod instalado (steam_api.dll y
    steam_appid.txt tienen que estar junto a prototypef.exe).
-2. coop.ini en los dos:  transport=steam
-   - Anfitrión: role=host
-   - Invitado:  role=client
-3. El anfitrión entra al juego. El mod crea un lobby y abre la ventana de
-   invitación de Steam: invita a su amigo desde ahí (o con clic derecho ->
-   Invitar a jugar).
-4. El invitado arranca el juego, acepta la invitación (overlay de Steam) y entra.
-   No hay IPs, ni puertos, ni router que tocar.
+2. coop.ini en los dos:  transport=steam  y  role=auto
+3. Uno arranca el juego: aparece la ventana "Prototype Co-op" con su nombre de
+   Steam (el que crea el lobby es el anfitrion automaticamente).
+4. Pulsa "Invitar a un amigo": se abre la lista de amigos de Steam; invita.
+5. El amigo arranca el juego y acepta la invitacion. Su nombre aparece en la
+   ventana del anfitrion.
+6. "Iniciar partida": el mod envia el save del anfitrion al invitado y arranca
+   la carga en los dos a la vez, en el mismo punto de la historia.
 
 Nota: Steam identifica la partida como AppID 480 ("Spacewar"), así que en el
 overlay apareceréis jugando a Spacewar. Es normal en este método.
