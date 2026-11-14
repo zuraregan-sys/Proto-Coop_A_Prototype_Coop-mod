@@ -2046,9 +2046,17 @@ static void PreloadTick()
 
     if (next >= 5)
     {
-        SendTransformStart(player, slotName, false);
+        // Put the player's own selection back through the same message path.
+        unsigned int restoreName[2] = { 0, 0 };
+        if (savedDesired != 0 && Plausible(reinterpret_cast<void*>(savedDesired)))
+            memcpy(restoreName, reinterpret_cast<void*>(savedDesired + 8), 8);
+        unsigned char restore[0x28] = { 0 };
+        reinterpret_cast<void (__thiscall*)(void*, const void*, const void*, bool)>(At<void*>(0x001215B0))(
+            restore, slotName, restoreName, false);
+        reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(player, restore);
         *reinterpret_cast<unsigned int*>(slots + 0x08) = savedDesired;
-        Log("preload: stop last, desired restored to %08X", savedDesired);
+        Log("preload: restored desired=%08X (saved %08X)", ReadU32(reinterpret_cast<void*>(slots), 0x08),
+            savedDesired);
         for (int k = 0; k < 5; ++k)
         {
             unsigned int found = 0;
@@ -2082,8 +2090,7 @@ static void PreloadTick()
     reinterpret_cast<void (__thiscall*)(void*, const void*, const void*, bool)>(At<void*>(0x001215B0))(
         message, slotName, descriptionName, false);
     reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(player, message);
-    SendTransformStart(player, slotName, false);
-    Log("preload: start hud=%u model=%08X", huds[next], model);
+    Log("preload: desired hud=%u model=%08X", huds[next], model);
     holdPending = next;
     holdTries = 0;
     ++next;
