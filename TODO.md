@@ -59,4 +59,12 @@ del snapshot, sin cuelgues ni crashes.
 - [ ] Armas en el suelo y vehiculos para los jugadores.
 - [ ] Salud/dano y agarres entre jugadores.
 - [ ] Modo historia, menu coop y polish (desync, ritmo de paquetes).
+
+## Steam
+
+- [x] Transporte por Steam (AppID 480): lobby friends-only, invitacion por overlay,
+      mensajes P2P por el relay de Valve y `transport=steam` en coop.ini.
+- [x] Verificado en local: init de Steamworks, creacion/entrada de lobby y carga de
+      las dos instancias. El enlace P2P real necesita dos cuentas de Steam.
+- [x] Automatizacion del menu robusta (repeticion hasta que hay jugador).
 - Sincronizacion de enemigos y bosses

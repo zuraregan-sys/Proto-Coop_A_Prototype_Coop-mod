@@ -126,6 +126,71 @@ namespace
         Log("loaded real xinput from %s", path);
     }
 
+    HWND g_window = nullptr;
+    DWORD g_lastFocus = 0;
+    char g_statePath[MAX_PATH] = { 0 };
+    DWORD g_stateChecked = 0;
+    bool g_gameRunning = false;
+
+    // The plugin writes "game" once a player object exists; until then the
+    // scripted menu repeats, so a slow front end still gets driven.
+    void InitStatePath(HMODULE self)
+    {
+        DWORD n = GetModuleFileNameA(self, g_statePath, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) { g_statePath[0] = 0; return; }
+        char* slash = strrchr(g_statePath, '\\');
+        if (slash == nullptr) { g_statePath[0] = 0; return; }
+        strcpy_s(slash + 1, MAX_PATH - (slash + 1 - g_statePath), "coop_menu.txt");
+    }
+
+    bool GameRunning()
+    {
+        DWORD now = GetTickCount();
+        if (now - g_stateChecked < 1000) return g_gameRunning;
+        g_stateChecked = now;
+        if (g_statePath[0] == 0) return g_gameRunning;
+        FILE* file = nullptr;
+        if (fopen_s(&file, g_statePath, "r") == 0 && file != nullptr)
+        {
+            char text[16] = { 0 };
+            fgets(text, sizeof(text), file);
+            fclose(file);
+            g_gameRunning = (text[0] == 'g' || text[0] == 'G');
+        }
+        return g_gameRunning;
+    }
+
+    BOOL CALLBACK FindMainWindow(HWND hwnd, LPARAM)
+    {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != GetCurrentProcessId()) return TRUE;
+        if (!IsWindowVisible(hwnd)) return TRUE;
+        if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+        g_window = hwnd;
+        return FALSE;
+    }
+
+    // The front end only takes the scripted pad while its window is active.
+    void FocusGame()
+    {
+        DWORD now = GetTickCount();
+        if (now - g_lastFocus < 900) return;
+        g_lastFocus = now;
+        if (g_window == nullptr || !IsWindow(g_window)) EnumWindows(FindMainWindow, 0);
+        if (g_window == nullptr) return;
+        if (GetForegroundWindow() == g_window) return;
+        DWORD foregroundThread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+        DWORD ownThread = GetCurrentThreadId();
+        if (foregroundThread != 0 && foregroundThread != ownThread)
+            AttachThreadInput(ownThread, foregroundThread, TRUE);
+        SetForegroundWindow(g_window);
+        SetWindowPos(g_window, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        if (foregroundThread != 0 && foregroundThread != ownThread)
+            AttachThreadInput(ownThread, foregroundThread, FALSE);
+        Log("focused window %p", g_window);
+    }
+
     WORD ButtonsAt(DWORD elapsedMs)
     {
         // Fast boot: args.txt skips the movies, legal screen and the loading
@@ -147,11 +212,14 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
     if (user == 0 && state != nullptr)
     {
         DWORD elapsed = GetTickCount() - g_start;
-        // The scripted menu covers the fast boot; afterwards the real device is
-        // forwarded so the player keeps full keyboard/pad control.
-        if (elapsed >= 36000)
-            return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
-        WORD buttons = ButtonsAt(elapsed);
+        // Once the plugin reports gameplay, or after the script has had its
+        // chances, the real device is forwarded again.
+        if (GameRunning()) return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
+        // Repeat the whole sequence every 22 s while the game has not reached
+        // gameplay, so a slow front end is still driven into the save list.
+        DWORD scripted = elapsed % 22000;
+        WORD buttons = ButtonsAt(scripted);
+        if (buttons != 0 || scripted < 7000) FocusGame();
         memset(state, 0, sizeof(*state));
         state->dwPacketNumber = ++g_packet;
         state->Gamepad.wButtons = buttons;
@@ -160,7 +228,7 @@ extern "C" DWORD WINAPI XInputGetState(DWORD user, XINPUT_STATE* state)
         state->Gamepad.sThumbRX = 0;
         state->Gamepad.sThumbRY = 0;
         if (buttons != 0)
-            Log("scripted buttons=%04X at %lu ms", buttons, elapsed);
+            Log("scripted buttons=%04X at %lu ms", buttons, scripted);
         return ERROR_SUCCESS;
     }
     return realGetState ? realGetState(user, state) : ERROR_DEVICE_NOT_CONNECTED;
@@ -240,6 +308,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         g_isClient = !g_movesForward;
         InitLog(module);
+        InitStatePath(module);
         Log("xinput proxy attached");
         LoadReal();
     }

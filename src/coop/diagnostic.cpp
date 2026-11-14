@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 #include "MinHook.h"
 
 #pragma comment(lib, "ws2_32.lib")
@@ -17,6 +18,7 @@
 
 static FILE* g_log = nullptr;
 static HMODULE g_engine = nullptr;
+static char g_iniPath[MAX_PATH] = { 0 };
 static unsigned int g_updateCalls = 0;
 static unsigned int g_sendCalls = 0;
 static unsigned int g_receiveCalls = 0;
@@ -70,6 +72,10 @@ static unsigned short g_localPort = 27016;
 static unsigned short g_peerPort = 27017;
 static char g_peerIp[64] = "127.0.0.1";
 static char g_bindIp[64] = "0.0.0.0";
+static bool g_steamTransport = false;
+static bool g_steamReady = false;
+static unsigned long long g_steamPeer = 0;
+static bool g_steamInvite = true;
 static bool g_isHost = true;
 static int g_testMove = 0;
 static bool g_testMoved = false;
@@ -210,6 +216,7 @@ static void ReadConfig()
     char* slash = strrchr(path, '\\');
     if (slash == nullptr) return;
     strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "coop.ini");
+    strcpy_s(g_iniPath, MAX_PATH, path);
 
     char role[32] = "host";
     GetPrivateProfileStringA("coop", "role", "host", role, sizeof(role), path);
@@ -218,6 +225,10 @@ static void ReadConfig()
     g_peerPort = (unsigned short)GetPrivateProfileIntA("coop", "peer_port", g_isHost ? 27017 : 27016, path);
     GetPrivateProfileStringA("coop", "peer_ip", "127.0.0.1", g_peerIp, sizeof(g_peerIp), path);
     GetPrivateProfileStringA("coop", "bind_ip", "0.0.0.0", g_bindIp, sizeof(g_bindIp), path);
+    char transportValue[32] = "udp";
+    GetPrivateProfileStringA("coop", "transport", "udp", transportValue, sizeof(transportValue), path);
+    g_steamTransport = (transportValue[0] == 's' || transportValue[0] == 'S');
+    g_steamInvite = GetPrivateProfileIntA("coop", "steam_invite", 1, path) != 0;
     g_peerMask = g_isHost ? 1 : 2;
     g_testMove = GetPrivateProfileIntA("coop", "test_move", 0, path);
     g_testOffsetY = (float)GetPrivateProfileIntA("coop", "test_offset_y", 0, path);
@@ -254,8 +265,359 @@ static void ReadConfig()
     g_intentTest = (float)GetPrivateProfileIntA("coop", "intent_test", 0, path);
     g_fakeSession = GetPrivateProfileIntA("coop", "fake_session", 0, path) != 0;
     g_puppetStatic = GetPrivateProfileIntA("coop", "puppet_static", 0, path) != 0;
-    Log("config role=%s local=%u peer=%u peer_ip=%s bind_ip=%s mask=%d offset_y=%.0f",
-        g_isHost ? "host" : "client", g_localPort, g_peerPort, g_peerIp, g_bindIp, g_peerMask, g_testOffsetY);
+    Log("config role=%s transport=%s local=%u peer=%u peer_ip=%s bind_ip=%s mask=%d offset_y=%.0f",
+        g_isHost ? "host" : "client", g_steamTransport ? "steam" : "udp", g_localPort, g_peerPort, g_peerIp,
+        g_bindIp, g_peerMask, g_testOffsetY);
+}
+
+// True when the configured transport can send right now.
+static bool NetReady()
+{
+    if (g_steamTransport) return g_steamReady;
+    return g_socket != INVALID_SOCKET;
+}
+
+// The one place packets leave the plugin: UDP to the peer address, or a Steam
+// networking message to the peer SteamID.
+static void NetSend(const void* data, int length);
+static void SteamSend(const void* data, int length);
+
+static void NetSend(const void* data, int length)
+{
+    if (g_steamTransport)
+    {
+        if (g_steamReady) SteamSend(data, length);
+        return;
+    }
+    if (g_socket == INVALID_SOCKET) return;
+    sendto(g_socket, reinterpret_cast<const char*>(data), length, 0, reinterpret_cast<sockaddr*>(&g_peer),
+        sizeof(g_peer));
+}
+
+// --- Steam transport (AppID 480 "Spacewar") --------------------------------
+// Loads a modern steam_api.dll next to the plugin, initialises Spacewar, creates
+// or joins a friends-only lobby and moves the plugin's own packets through
+// Valve's relay, so there are no IPs, ports or NAT to touch.
+
+static void HandlePacket(const unsigned char* data, int length);
+
+#pragma pack(push, 8)
+struct SteamCallbackMsg
+{
+    int hSteamUser;
+    int callback;
+    unsigned char* param;
+    int param_size;
+};
+struct SteamAPICallCompleted_t
+{
+    unsigned long long call;
+    int callback;
+    unsigned int param_size;
+};
+struct SteamLobbyCreated_t
+{
+    int result;
+    unsigned long long lobby;
+};
+struct SteamLobbyEnter_t
+{
+    unsigned long long lobby;
+    unsigned int perms;
+    bool locked;
+    unsigned int response;
+};
+struct SteamLobbyChatUpdate_t
+{
+    unsigned long long lobby;
+    unsigned long long userChanged;
+    unsigned long long makingChange;
+    unsigned int stateChange;
+};
+struct SteamGameLobbyJoinRequested_t
+{
+    unsigned long long lobby;
+    unsigned long long friendId;
+};
+#pragma pack(pop)
+
+static HMODULE g_steamDll = nullptr;
+static void* g_steamUser = nullptr;
+static void* g_steamMatchmaking = nullptr;
+static void* g_steamFriends = nullptr;
+static void* g_steamMessages = nullptr;
+static unsigned long long g_steamId = 0;
+static unsigned long long g_steamLobby = 0;
+static unsigned int g_steamPipe = 0;
+
+typedef int (__cdecl* SteamInitFlatFn)(char*);
+typedef unsigned int (__cdecl* SteamGetHSteamPipeFn)();
+typedef void (__cdecl* SteamManualInitFn)();
+typedef void (__cdecl* SteamRunFrameFn)(unsigned int);
+typedef bool (__cdecl* SteamNextCallbackFn)(unsigned int, SteamCallbackMsg*);
+typedef void (__cdecl* SteamFreeCallbackFn)(unsigned int);
+typedef bool (__cdecl* SteamCallResultFn)(unsigned int, unsigned long long, void*, int, int, bool*);
+typedef void* (__cdecl* SteamInterfaceFn)();
+typedef unsigned long long (__cdecl* SteamGetIdFn)(void*);
+typedef bool (__cdecl* SteamLoggedOnFn)(void*);
+typedef unsigned long long (__cdecl* SteamCreateLobbyFn)(void*, int, int);
+typedef unsigned long long (__cdecl* SteamJoinLobbyFn)(void*, unsigned long long);
+typedef bool (__cdecl* SteamSetLobbyDataFn)(void*, unsigned long long, const char*, const char*);
+typedef bool (__cdecl* SteamSetJoinableFn)(void*, unsigned long long, bool);
+typedef unsigned long long (__cdecl* SteamLobbyOwnerFn)(void*, unsigned long long);
+typedef void (__cdecl* SteamRichPresenceFn)(void*, const char*, const char*);
+typedef void (__cdecl* SteamInviteDialogFn)(void*, unsigned long long);
+typedef void (__cdecl* SteamSetSteamIdFn)(void*, unsigned long long);
+typedef int (__cdecl* SteamSendToUserFn)(void*, const void*, const void*, unsigned int, int, int);
+typedef int (__cdecl* SteamReceiveFn)(void*, int, void**, int);
+typedef bool (__cdecl* SteamAcceptFn)(void*, const void*);
+typedef void (__cdecl* SteamReleaseFn)(void*);
+
+static SteamInitFlatFn SteamInitFlat = nullptr;
+static SteamGetHSteamPipeFn SteamGetPipe = nullptr;
+static SteamManualInitFn SteamManualInit = nullptr;
+static SteamRunFrameFn SteamRunFrame = nullptr;
+static SteamNextCallbackFn SteamNextCallback = nullptr;
+static SteamFreeCallbackFn SteamFreeCallback = nullptr;
+static SteamCallResultFn SteamCallResult = nullptr;
+static SteamInterfaceFn SteamUserInterface = nullptr;
+static SteamInterfaceFn SteamMatchmakingInterface = nullptr;
+static SteamInterfaceFn SteamFriendsInterface = nullptr;
+static SteamInterfaceFn SteamMessagesInterface = nullptr;
+static SteamGetIdFn SteamGetId = nullptr;
+static SteamLoggedOnFn SteamLoggedOn = nullptr;
+static SteamCreateLobbyFn SteamCreateLobby = nullptr;
+static SteamJoinLobbyFn SteamJoinLobby = nullptr;
+static SteamSetLobbyDataFn SteamSetLobbyData = nullptr;
+static SteamSetJoinableFn SteamSetJoinable = nullptr;
+static SteamLobbyOwnerFn SteamLobbyOwner = nullptr;
+static SteamRichPresenceFn SteamRichPresence = nullptr;
+static SteamInviteDialogFn SteamInviteDialog = nullptr;
+static SteamSetSteamIdFn SteamSetSteamId = nullptr;
+static SteamSendToUserFn SteamSendToUser = nullptr;
+static SteamReceiveFn SteamReceive = nullptr;
+static SteamAcceptFn SteamAccept = nullptr;
+static SteamReleaseFn SteamReleaseMsg = nullptr;
+
+static bool SteamApiLoaded()
+{
+    return SteamSendToUser != nullptr && SteamAccept != nullptr && SteamReceive != nullptr;
+}
+
+static void SteamSend(const void* data, int length)
+{
+    if (!SteamApiLoaded() || g_steamPeer == 0) return;
+    unsigned char identity[160];
+    memset(identity, 0, sizeof(identity));
+    SteamSetSteamId(identity, g_steamPeer);
+    SteamSendToUser(g_steamMessages, identity, data, (unsigned int)length, 5 /* unreliable, no delay */, 0);
+}
+
+static void SteamOnLobby(SteamLobbyEnter_t* enter)
+{
+    if (enter == nullptr || enter->response != 1) return;
+    g_steamLobby = enter->lobby;
+    Log("steam: lobby %llu entered", g_steamLobby);
+    if (!g_isHost)
+        g_steamPeer = SteamLobbyOwner(g_steamMatchmaking, g_steamLobby);
+    if (g_steamPeer != 0)
+        Log("steam: peer=%llu", g_steamPeer);
+}
+
+static void SteamPoll()
+{
+    if (!g_steamReady) return;
+    SteamRunFrame(g_steamPipe);
+    SteamCallbackMsg msg;
+    while (SteamNextCallback(g_steamPipe, &msg))
+    {
+        if (msg.callback == 703)
+        {
+            SteamAPICallCompleted_t* done = reinterpret_cast<SteamAPICallCompleted_t*>(msg.param);
+            if (done != nullptr && done->callback == 513)
+            {
+                SteamLobbyCreated_t created;
+                bool failed = false;
+                if (SteamCallResult(g_steamPipe, done->call, &created, sizeof(created), 513, &failed) && !failed &&
+                    created.result == 1)
+                {
+                    g_steamLobby = created.lobby;
+                    Log("steam: lobby %llu created", g_steamLobby);
+                    SteamSetLobbyData(g_steamMatchmaking, g_steamLobby, "game", "prototype-coop");
+                    SteamSetJoinable(g_steamMatchmaking, g_steamLobby, true);
+                    SteamRichPresence(g_steamFriends, "connect", "+prototype_coop");
+                    SteamRichPresence(g_steamFriends, "status", "Prototype Co-op: waiting for a friend");
+                    if (g_steamInvite) SteamInviteDialog(g_steamFriends, g_steamLobby);
+                }
+            }
+        }
+        else if (msg.callback == 504)
+        {
+            SteamOnLobby(reinterpret_cast<SteamLobbyEnter_t*>(msg.param));
+        }
+        else if (msg.callback == 506)
+        {
+            SteamLobbyChatUpdate_t* update = reinterpret_cast<SteamLobbyChatUpdate_t*>(msg.param);
+            if (update != nullptr && g_isHost && (update->stateChange & 0x1) != 0 &&
+                update->userChanged != g_steamId)
+            {
+                g_steamPeer = update->userChanged;
+                Log("steam: guest=%llu joined", g_steamPeer);
+            }
+        }
+        else if (msg.callback == 333)
+        {
+            SteamGameLobbyJoinRequested_t* join = reinterpret_cast<SteamGameLobbyJoinRequested_t*>(msg.param);
+            if (join != nullptr)
+            {
+                Log("steam: joining lobby %llu", join->lobby);
+                SteamJoinLobby(g_steamMatchmaking, join->lobby);
+            }
+        }
+        else if (msg.callback == 1251)
+        {
+            SteamAccept(g_steamMessages, msg.param);
+        }
+        else if (msg.callback == 1252)
+        {
+            Log("steam: session failed");
+        }
+        SteamFreeCallback(g_steamPipe);
+    }
+    void* messages[32];
+    int received = SteamReceive(g_steamMessages, 0, messages, 32);
+    for (int i = 0; i < received; ++i)
+    {
+        void* message = messages[i];
+        if (message == nullptr) continue;
+        unsigned char* data = *reinterpret_cast<unsigned char**>(message);
+        unsigned int size = *reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned char*>(message) + 4);
+        if (data != nullptr && size > 0) HandlePacket(data, (int)size);
+        SteamReleaseMsg(message);
+    }
+}
+
+static bool SteamStart()
+{
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(GetModuleHandleA("prototype_coop.asi"), path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return false;
+    char* slash = strrchr(path, '\\');
+    if (slash == nullptr) return false;
+    char dllPath[MAX_PATH];
+    strcpy_s(dllPath, MAX_PATH, path);
+    char* dllSlash = strrchr(dllPath, '\\');
+    if (dllSlash == nullptr) return false;
+    strcpy_s(dllSlash + 1, MAX_PATH - (dllSlash + 1 - dllPath), "steam_api.dll");
+    g_steamDll = LoadLibraryA(dllPath);
+    if (g_steamDll == nullptr)
+    {
+        Log("steam: steam_api.dll not found next to the plugin");
+        return false;
+    }
+    SteamInitFlat = reinterpret_cast<SteamInitFlatFn>(GetProcAddress(g_steamDll, "SteamAPI_InitFlat"));
+    SteamGetPipe = reinterpret_cast<SteamGetHSteamPipeFn>(GetProcAddress(g_steamDll, "SteamAPI_GetHSteamPipe"));
+    SteamManualInit = reinterpret_cast<SteamManualInitFn>(GetProcAddress(g_steamDll, "SteamAPI_ManualDispatch_Init"));
+    SteamRunFrame = reinterpret_cast<SteamRunFrameFn>(GetProcAddress(g_steamDll, "SteamAPI_ManualDispatch_RunFrame"));
+    SteamNextCallback = reinterpret_cast<SteamNextCallbackFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ManualDispatch_GetNextCallback"));
+    SteamFreeCallback = reinterpret_cast<SteamFreeCallbackFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ManualDispatch_FreeLastCallback"));
+    SteamCallResult = reinterpret_cast<SteamCallResultFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ManualDispatch_GetAPICallResult"));
+    SteamUserInterface = reinterpret_cast<SteamInterfaceFn>(GetProcAddress(g_steamDll, "SteamAPI_SteamUser_v023"));
+    SteamMatchmakingInterface = reinterpret_cast<SteamInterfaceFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_SteamMatchmaking_v009"));
+    SteamFriendsInterface = reinterpret_cast<SteamInterfaceFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_SteamFriends_v018"));
+    SteamMessagesInterface = reinterpret_cast<SteamInterfaceFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_SteamNetworkingMessages_SteamAPI_v002"));
+    SteamSetSteamId = reinterpret_cast<SteamSetSteamIdFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_SteamNetworkingIdentity_SetSteamID64"));
+    SteamReleaseMsg = reinterpret_cast<SteamReleaseFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_SteamNetworkingMessage_t_Release"));
+    SteamCreateLobby = reinterpret_cast<SteamCreateLobbyFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamMatchmaking_CreateLobby"));
+    SteamJoinLobby = reinterpret_cast<SteamJoinLobbyFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamMatchmaking_JoinLobby"));
+    SteamSetLobbyData = reinterpret_cast<SteamSetLobbyDataFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamMatchmaking_SetLobbyData"));
+    SteamSetJoinable = reinterpret_cast<SteamSetJoinableFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamMatchmaking_SetLobbyJoinable"));
+    SteamLobbyOwner = reinterpret_cast<SteamLobbyOwnerFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamMatchmaking_GetLobbyOwner"));
+    SteamRichPresence = reinterpret_cast<SteamRichPresenceFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamFriends_SetRichPresence"));
+    SteamInviteDialog = reinterpret_cast<SteamInviteDialogFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog"));
+    SteamGetId = reinterpret_cast<SteamGetIdFn>(GetProcAddress(g_steamDll, "SteamAPI_ISteamUser_GetSteamID"));
+    SteamLoggedOn = reinterpret_cast<SteamLoggedOnFn>(GetProcAddress(g_steamDll, "SteamAPI_ISteamUser_BLoggedOn"));
+    SteamSendToUser = reinterpret_cast<SteamSendToUserFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamNetworkingMessages_SendMessageToUser"));
+    SteamReceive = reinterpret_cast<SteamReceiveFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel"));
+    SteamAccept = reinterpret_cast<SteamAcceptFn>(
+        GetProcAddress(g_steamDll, "SteamAPI_ISteamNetworkingMessages_AcceptSessionWithUser"));
+    if (SteamInitFlat == nullptr || SteamGetPipe == nullptr || SteamManualInit == nullptr ||
+        SteamRunFrame == nullptr || SteamNextCallback == nullptr || SteamFreeCallback == nullptr ||
+        SteamCallResult == nullptr || SteamUserInterface == nullptr || SteamMatchmakingInterface == nullptr ||
+        SteamFriendsInterface == nullptr || SteamMessagesInterface == nullptr || SteamSetSteamId == nullptr ||
+        SteamReleaseMsg == nullptr || !SteamApiLoaded())
+    {
+        Log("steam: steam_api.dll is too old (missing flat API exports)");
+        return false;
+    }
+    char appIdPath[MAX_PATH];
+    strcpy_s(appIdPath, MAX_PATH, path);
+    char* appSlash = strrchr(appIdPath, '\\');
+    if (appSlash != nullptr)
+    {
+        strcpy_s(appSlash + 1, MAX_PATH - (appSlash + 1 - appIdPath), "steam_appid.txt");
+        FILE* appId = nullptr;
+        if (fopen_s(&appId, appIdPath, "r") != 0 || appId == nullptr)
+        {
+            if (fopen_s(&appId, appIdPath, "w") == 0 && appId != nullptr)
+            {
+                fputs("480\n", appId);
+                fclose(appId);
+            }
+        }
+        else
+        {
+            fclose(appId);
+        }
+    }
+    char error[1024] = { 0 };
+    int result = SteamInitFlat(error);
+    if (result != 0)
+    {
+        Log("steam: init failed (%d) %s", result, error);
+        return false;
+    }
+    SteamManualInit();
+    g_steamPipe = SteamGetPipe();
+    g_steamUser = SteamUserInterface();
+    g_steamMatchmaking = SteamMatchmakingInterface();
+    g_steamFriends = SteamFriendsInterface();
+    g_steamMessages = SteamMessagesInterface();
+    g_steamId = SteamGetId(g_steamUser);
+    Log("steam: ready id=%llu logged=%d", g_steamId, SteamLoggedOn(g_steamUser) ? 1 : 0);
+    if (g_isHost)
+    {
+        SteamCreateLobby(g_steamMatchmaking, 1 /* friends only */, 2);
+        Log("steam: creating lobby");
+    }
+    else
+    {
+        char lobbyText[32] = { 0 };
+        GetPrivateProfileStringA("coop", "steam_lobby", "", lobbyText, sizeof(lobbyText), g_iniPath);
+        if (lobbyText[0] != 0)
+        {
+            unsigned long long lobby = strtoull(lobbyText, nullptr, 10);
+            if (lobby != 0) SteamJoinLobby(g_steamMatchmaking, lobby);
+        }
+    }
+    return true;
 }
 
 static bool InitSocket()
@@ -295,7 +657,9 @@ static void SendHeartbeat()
     unsigned char packet[8] = { 'P', 'C', 'O', 'P', 0, 0, 0, 0 };
     ++g_heartbeat;
     memcpy(packet + 4, &g_heartbeat, sizeof(g_heartbeat));
-    int sent = sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+    int sent = 0;
+        NetSend(packet, sizeof(packet));
+        sent = sizeof(packet);
     if (sent == sizeof(packet))
         Log("heartbeat %u", g_heartbeat);
     else
@@ -367,7 +731,7 @@ static bool g_remoteBasisValid = false;
 static void SendRotation()
 {
     void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
-    if (player == nullptr || g_socket == INVALID_SOCKET) return;
+    if (player == nullptr || !NetReady()) return;
     const float* matrix = ReadInlineMatrix(player);
     if (matrix == nullptr) return;
     unsigned char packet[4 + 12 * 4];
@@ -376,7 +740,7 @@ static void SendRotation()
     packet[2] = 0;
     packet[3] = 0;
     memcpy(packet + 4, matrix, 12 * 4);
-    sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+    NetSend(packet, sizeof(packet));
 }
 
 static void StoreRotation(const unsigned char* data, int length)
@@ -391,7 +755,7 @@ static void SendPose()
 {
     void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     if (!g_poseEnterLogged) { g_poseEnterLogged = true; Log("pose enter: player=%p socket=%d", player, (int)g_socket); }
-    if (player == nullptr || g_socket == INVALID_SOCKET) return;
+    if (player == nullptr || !NetReady()) return;
     unsigned int pose = GetAttributeValue(player, 0x10E80688);
     if (!Plausible(reinterpret_cast<void*>(pose))) return;
     unsigned int joints = ReadU32(reinterpret_cast<void*>(pose), 0x14);
@@ -414,7 +778,7 @@ static void SendPose()
         memcpy(packet + 4 + i * 32, reinterpret_cast<void*>(rotations + i * 16), 16);
         memcpy(packet + 4 + i * 32 + 16, reinterpret_cast<void*>(translations + i * 16), 16);
     }
-    sendto(g_socket, (const char*)packet, 4 + (int)joints * 32, 0, (sockaddr*)&g_peer, sizeof(g_peer));
+    NetSend(packet, 4 + (int)joints * 32);
 }
 
 static void StorePose(const unsigned char* data, int length)
@@ -454,7 +818,7 @@ static void SendPlayerTransform()
     memcpy(packet + 4, &sy, 2);
     memcpy(packet + 6, &sz, 2);
     Log("transform send(%s) %.2f %.2f %.2f -> %d %d %d", g_isHost ? "host" : "client", x, y, z, sx, sy, sz);
-    sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+    NetSend(packet, sizeof(packet));
 }
 
 static const char* NameText(const void* name)
@@ -1368,7 +1732,7 @@ static void SendModel()
 {
     // The transformation system already swaps the puppet's model: the manual
     // archetype swap only covers sessions where the scripts are unavailable.
-    if (g_luaPowers || !g_syncModel || g_socket == INVALID_SOCKET) return;
+    if (g_luaPowers || !g_syncModel || !NetReady()) return;
     void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     if (player == nullptr) return;
     void* render = FindBehaviourByName(player, "RenderBehaviour");
@@ -1388,8 +1752,7 @@ static void SendModel()
     packet[0] = 'M';
     packet[1] = '2';
     memcpy(packet + 2, name, 8);
-    sendto(g_socket, reinterpret_cast<const char*>(packet), 10, 0, reinterpret_cast<sockaddr*>(&g_peer),
-        sizeof(g_peer));
+    NetSend(packet, 10);
     Log("model send: %08X%08X player=%08X render=%08X owner=%08X", (unsigned int)(value >> 32),
         (unsigned int)value, (unsigned int)player, (unsigned int)render, ReadU32(render, 4));
 }
@@ -1899,7 +2262,7 @@ static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect
     packet[1] = '1';
     memcpy(packet + 2, name, 8);
     memcpy(packet + 10, setup, 0xA0);
-    sendto(g_socket, (const char*)packet, sizeof(packet), 0, (sockaddr*)&g_peer, sizeof(g_peer));
+    NetSend(packet, sizeof(packet));
     ++g_effectSendCount;
     if (g_logEffects)
         Log("fx send #%u name=%08X target=%08X", g_effectSendCount, ReadU32(name, 0), target);
@@ -1935,7 +2298,7 @@ static void __attribute__((force_align_arg_pointer)) __thiscall HookSend(void* s
         if (g_sendCalls++ < 40)
             Log("fake Channel::Send target=%d type=%d len=%u flag=%d", target, type, length, flag);
         if (g_socket != INVALID_SOCKET && data != nullptr)
-            sendto(g_socket, (const char*)data, length, 0, (sockaddr*)&g_peer, sizeof(g_peer));
+            NetSend(data, length);
         return;
     }
     if (g_sendCalls < 40)
@@ -2074,7 +2437,7 @@ static bool IsPowerWheelOpen(void* player)
 
 static void SendTransformState()
 {
-    if (!g_transportReady || g_socket == INVALID_SOCKET) return;
+    if (!g_transportReady || !NetReady()) return;
     void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     if (player == nullptr || IsPowerWheelOpen(player)) return;
     TransformSlotState state[8];
@@ -2107,7 +2470,7 @@ static void SendTransformState()
         memcpy(packet + offset, state[i].activeDescription, 8); offset += 8;
         packet[offset++] = static_cast<unsigned char>(state[i].active);
     }
-    sendto(g_socket, reinterpret_cast<const char*>(packet), offset, 0, reinterpret_cast<sockaddr*>(&g_peer), sizeof(g_peer));
+    NetSend(packet, offset);
     memcpy(g_lastSentSlots, state, sizeof(state));
     g_lastSentSlotCount = count;
     g_lastSlotSend = now;
@@ -2118,7 +2481,7 @@ static void SendTransformState()
 // the puppet. Layout mirrors effecttrack.h (MotionTrailTrack offsets).
 static void SendMotionTrail(void* track)
 {
-    if (g_socket == INVALID_SOCKET || track == nullptr) return;
+    if (!NetReady() || track == nullptr) return;
     unsigned char packet[2 + 7 * 4 + 4 + 4 + 8 + 8 + 6 * 8 + 6 * 12 + 12];
     int offset = 2;
     packet[0] = 'M';
@@ -2157,7 +2520,7 @@ static void SendMotionTrail(void* track)
         putVector((const unsigned char*)track + 0x50 + i * 12);
     }
     putVector((const unsigned char*)track + 0x98); // shrinkOffset
-    sendto(g_socket, (const char*)packet, offset, 0, (sockaddr*)&g_peer, sizeof(g_peer));
+    NetSend(packet, offset);
     if (g_logEffects) Log("motion trail send");
 }
 
@@ -3437,7 +3800,7 @@ static int CollectCityEntries(CityEntry* entries, int max)
 
 static void SendCitySnapshot()
 {
-    if (g_socket == INVALID_SOCKET) return;
+    if (!NetReady()) return;
     CityEntry entries[CITY_MAX];
     int count = CollectCityEntries(entries, CITY_MAX);
     if (count <= 0) return;
@@ -3457,8 +3820,7 @@ static void SendCitySnapshot()
         memcpy(packet + offset, &entries[i].qy, 2); offset += 2;
         memcpy(packet + offset, &entries[i].qz, 2); offset += 2;
     }
-    sendto(g_socket, reinterpret_cast<const char*>(packet), offset, 0, reinterpret_cast<sockaddr*>(&g_peer),
-        sizeof(g_peer));
+    NetSend(packet, offset);
     ++g_citySendCount;
     static unsigned int lastLog = 0;
     unsigned int now = GetTickCount();
@@ -3669,6 +4031,27 @@ static void CityTick()
     if ((g_updateCalls % 15) == 0) SendCitySnapshot();
 }
 
+// Tells the input proxy whether the game reached gameplay; until then it keeps
+// driving the front end.
+static void WriteMenuState(bool inGame)
+{
+    static int lastState = -1;
+    int state = inGame ? 1 : 0;
+    if (state == lastState) return;
+    lastState = state;
+    char path[MAX_PATH];
+    strcpy_s(path, MAX_PATH, g_iniPath);
+    char* slash = strrchr(path, '\\');
+    if (slash == nullptr) return;
+    strcpy_s(slash + 1, MAX_PATH - (slash + 1 - path), "coop_menu.txt");
+    FILE* file = nullptr;
+    if (fopen_s(&file, path, "w") == 0 && file != nullptr)
+    {
+        fputs(inGame ? "game\n" : "menu\n", file);
+        fclose(file);
+    }
+}
+
 static void FrameTick()
 {
     // Both tick sources (engine sync and the controller) may fire in one frame.
@@ -3682,6 +4065,7 @@ static void FrameTick()
     // cached for the old one is stale.
     static void* lastPlayer = nullptr;
     void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    WriteMenuState(localPlayer != nullptr);
     if ((g_luaPowers || g_dumpLua) && !g_luaCatalogLoaded && localPlayer != nullptr)
         LoadLuaPowerCatalogIfReady();
     ApplyModel();
@@ -3745,6 +4129,7 @@ static void FrameTick()
         }
     }
 
+    if (g_steamReady) SteamPoll();
     PollSocket();
     g_phase = 2;
 
@@ -3752,6 +4137,12 @@ static void FrameTick()
     {
         if (g_fakeSession)
             StartFakeSession();
+        else if (g_steamTransport)
+        {
+            g_steamReady = SteamStart();
+            g_transportReady = g_steamReady;
+            Log("transport ready=%d (steam)", g_transportReady ? 1 : 0);
+        }
         else
         {
             g_transportReady = InitSocket();

@@ -119,6 +119,9 @@ city_near=60         ; reserved (the category stream does not filter by it)
 city_vehicles=1      ; also replicate vehicles (its own local template)
 city_pose=0          ; reserved (driving the copies' poses faults in the engine)
 city_dump=1          ; 1 = log template/behaviour of the actors around the player
+transport=udp        ; udp (peer_ip) | steam (lobby + invite)
+steam_invite=1       ; 1 = open the Steam invite dialog when the lobby is created
+steam_lobby=0        ; optional: join this lobby id instead of waiting for an invite
 ```
 
 ## Building
@@ -133,6 +136,8 @@ Outputs `build\coop\prototype_coop.asi` and `build\coop\xinput1_3.dll`.
 
 ## Play with friends
 
+Steam handles the connection: no IPs, no port forwarding, no router.
+
 1. Both players need their own **Prototype (Steam, App ID 10150)** and
    **PrototypeFix** installed (PrototypeFix is the ASI loader the game uses).
 2. Build the mod and create the friend package:
@@ -142,23 +147,34 @@ Outputs `build\coop\prototype_coop.asi` and `build\coop\xinput1_3.dll`.
    .\tools\make-package.ps1
    ```
 
-   `dist\ProtoCoop-<build>.zip` contains only the mod (`prototype_coop.asi`),
-   a `coop.ini` template and a plain-words `LEEME.txt`, no game files.
-3. Both copy `prototype_coop.asi` next to `prototypef.exe` and edit `coop.ini`:
-
-   | | Host | Guest |
-   |---|---|---|
-   | `role` | `host` | `client` |
-   | `port` | `27016` | `27017` |
-   | `peer_port` | `27017` | `27016` |
-   | `peer_ip` | the guest's address | the host's address |
-
-4. Same network: use each other's local IP (`ipconfig`). Over the Internet the
-   simple path is a mesh VPN (Tailscale, ZeroTier, Hamachi/Radmin) and the VPN
-   address as `peer_ip`; otherwise forward UDP 27016/27017 and open them in the
-   firewall. Allow `prototypef.exe` on private networks when Windows asks.
+   `dist\ProtoCoop-<build>.zip` contains the mod (`prototype_coop.asi`), a
+   pinned `steam_api.dll`, `steam_appid.txt` (480), a `coop.ini` template and a
+   plain-words `LEEME.txt`. No game files.
+3. Both copy the contents next to `prototypef.exe` and set `transport=steam`
+   in `coop.ini`; the host uses `role=host` and the guest `role=client`.
+4. The host starts the game: the mod creates a friends-only lobby and opens the
+   Steam invite dialog. The guest starts the game and accepts the invite.
 5. Progress: on one PC both instances share the save folder. For two PCs copy
    the host's slots first with `tools\sync-save.ps1`.
+
+The game appears as AppID 480 ("Spacewar") in Steam, which is the standard relay
+trick for mods. Two instances on the same PC share one Steam account and
+therefore cannot talk to each other over Steam; use `transport=udp` with
+`127.0.0.1` for local tests.
+
+### LAN or VPN (fallback)
+
+`transport=udp` (the default) sends to `peer_ip:peer_port`:
+
+| | Host | Guest |
+|---|---|---|
+| `port` | `27016` | `27017` |
+| `peer_port` | `27017` | `27016` |
+| `peer_ip` | the guest's address | the host's address |
+
+Same network: the other PC's local IP. Over the Internet: a mesh VPN (Tailscale,
+ZeroTier, Hamachi) and its address, or forward UDP 27016/27017. Allow
+`prototypef.exe` on private networks when Windows asks.
 
 ## Saves
 
