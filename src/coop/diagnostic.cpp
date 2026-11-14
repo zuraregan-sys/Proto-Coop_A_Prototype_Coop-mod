@@ -101,6 +101,7 @@ static bool g_whipPuppet = false;
 static bool g_puppetNoChoreo = true;
 static bool g_cityCensus = false;
 static bool g_cityPose = false;
+static bool g_cityVehicles = false;
 static int g_cityRadius = 300;
 static int g_cityNear = 60;
 static bool g_cityOn = false;
@@ -234,6 +235,7 @@ static void ReadConfig()
     g_cityRadius = GetPrivateProfileIntA("coop", "city_radius", 300, path);
     g_cityNear = GetPrivateProfileIntA("coop", "city_near", 60, path);
     g_cityPose = GetPrivateProfileIntA("coop", "city_pose", 0, path) != 0;
+    g_cityVehicles = GetPrivateProfileIntA("coop", "city_vehicles", 0, path) != 0;
     if (g_cityRadius < 20) g_cityRadius = 20;
     g_luaPowers = GetPrivateProfileIntA("coop", "lua_powers", 1, path) != 0;
     g_dumpLua = GetPrivateProfileIntA("coop", "dump_lua", 0, path) != 0;
@@ -2917,6 +2919,8 @@ static void ReplayRemoteTransformations()
 }
 
 static void HandleCitySnapshot(const unsigned char* data, int length);
+static bool LiveGameObject(void* object);
+static bool ValidTemplate(void* tmpl, unsigned int hash);
 static void StoreCityPose(const unsigned char* data, int length);
 
 static void HandlePacket(const unsigned char* data, int length)
@@ -3348,9 +3352,6 @@ static int CollectCityEntries(CityEntry* entries, int max)
         if (dx * dx + dy * dy + dz * dz > radius2) continue;
         // The actor already lives in the peer's world when it is close to the
         // peer; sending it would only draw a second copy next to the local one.
-        float ex = x - g_remoteX, ey = y - g_remoteY, ez = z - g_remoteZ;
-        float keepOut = static_cast<float>(g_cityNear);
-        if (ex * ex + ey * ey + ez * ez < keepOut * keepOut) continue;
         if (ObjectKind(object) != OBJECT_CHARACTER) continue;
         void* tmpl = LookupTemplate(object);
         if (tmpl == nullptr) continue;
@@ -3370,6 +3371,7 @@ static int CollectCityEntries(CityEntry* entries, int max)
     }
     // Vehicles fill the leftover room, a few per snapshot, with the same rule:
     // only the ones the peer does not have around it.
+    if (!g_cityVehicles) return count;
     int vehicles = 0;
     for (unsigned int i = 0; i < 0x1800 && count < max && vehicles < 8; ++i)
     {
@@ -3574,8 +3576,8 @@ static void ProcessCitySnapshot()
         {
             if (g_cityMirrorCount >= CITY_MAX) continue;
             void* tmpl = FindSpawnedTemplateByHash(hash);
-            if (tmpl == nullptr) tmpl = FindInventoryTemplateByHash(hash);
-            if (tmpl == nullptr)
+            if (!ValidTemplate(tmpl, hash)) tmpl = FindInventoryTemplateByHash(hash);
+            if (!ValidTemplate(tmpl, hash))
             {
                 ++g_cityMissingTemplates;
                 continue;
@@ -3606,6 +3608,12 @@ static void ProcessCitySnapshot()
             g_cityMirrors[found].id = id;
             g_cityMirrors[found].object = object;
         }
+        if (!LiveGameObject(g_cityMirrors[found].object))
+        {
+            g_cityMirrors[found].object = nullptr;
+            g_cityMirrors[found].id = 0;
+            continue;
+        }
         g_cityMirrors[found].lastSeen = now;
         SetObjectPosition(g_cityMirrors[found].object, qx / 8.0f, qy / 8.0f, qz / 8.0f);
     }
@@ -3619,6 +3627,7 @@ static void ApplyCityPose(CityPose& pose)
     {
         if (g_cityMirrors[k].object == nullptr || g_cityMirrors[k].id != pose.id) continue;
         void* object = g_cityMirrors[k].object;
+        if (!LiveGameObject(object)) continue;
         unsigned int posePtr = GetAttributeValue(object, 0x10E80688);
         if (!Plausible(reinterpret_cast<void*>(posePtr))) return;
         unsigned int joints = ReadU32(reinterpret_cast<void*>(posePtr), 0x14);
@@ -3687,12 +3696,37 @@ static void StoreCityPose(const unsigned char* data, int length)
 }
 
 // Mirrors that stop arriving are moved out of sight and their slot is reused.
+// A mirror can be destroyed by the world; its pointer must be validated before
+// every use (the engine aborts on a position write to freed memory).
+static bool LiveGameObject(void* object)
+{
+    if (!Plausible(object)) return false;
+    return ReadU32(object, 0) == 0x10E686C0;
+}
+
+// A template from the spawn index can be stale (the object pointer was reused);
+// the name hash it carries is the cheap check.
+static bool ValidTemplate(void* tmpl, unsigned int hash)
+{
+    if (!Plausible(tmpl) || g_engine == nullptr) return false;
+    unsigned int base = reinterpret_cast<unsigned int>(g_engine);
+    unsigned int vtable = ReadU32(tmpl, 0);
+    if (vtable < base || vtable >= base + 0x1400000) return false;
+    return ReadU32(tmpl, 0x10) == hash;
+}
+
 static void ExpireCityMirrors()
 {
     unsigned int now = GetTickCount();
     for (int k = 0; k < g_cityMirrorCount; ++k)
     {
         if (g_cityMirrors[k].object == nullptr) continue;
+        if (!LiveGameObject(g_cityMirrors[k].object))
+        {
+            g_cityMirrors[k].object = nullptr;
+            g_cityMirrors[k].id = 0;
+            continue;
+        }
         if (now - g_cityMirrors[k].lastSeen <= 4000) continue;
         SetObjectPosition(g_cityMirrors[k].object, 0.0f, -5000.0f, 0.0f);
         Log("city: mirror %p expired", g_cityMirrors[k].object);

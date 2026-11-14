@@ -52,11 +52,12 @@ spawns a visual copy with every behaviour except the render one switched off, so
 it cannot fight, move on its own or run mission code. Copies that stop arriving
 are moved out of sight and their slot is reused.
 
-Actors closer than `city_near` (60 m) to the **peer** are never sent: they already
-live in its world, so skipping them is what keeps the shared area free of double
-NPCs. The copies are static (no animation) for now: driving their pose faults in
-the engine, so the stream stays behind `city_pose=0`. When the players separate,
-each one sees the other's surroundings populated.
+Both sides stream their nearest characters, so each window shows the union of the
+two cities (the same set of characters on both). The copies are static for now:
+driving their pose faults in the engine, so the stream stays behind `city_pose=0`.
+Vehicles are **not** mirrored (`city_vehicles=0`): duplicating their templates
+faults inside the physics setup (`ConstraintAngularVelocity::SetAxis`), so tanks
+and cars still differ between the two windows.
 
 ## How it works right now (for testing)
 
@@ -111,7 +112,8 @@ whip_puppet=0        ; 1 = also apply the whip to the puppet (crashes: engine li
 puppet_nochoreo=1    ; 1 = keep the avatar out of the engine's animation jobs (default)
 city_radius=300      ; stream the characters around each player within this radius
 city_census=0        ; 1 = log the city composition around the player every 2 s
-city_near=60         ; actors this close to the peer are not mirrored (no duplicates)
+city_near=60         ; reserved for the duplicate filter (not used by default)
+city_vehicles=0      ; 1 = also mirror vehicles (faults in the engine)
 city_pose=0          ; 1 = stream the nearest copies' poses (faults in the engine)
 ```
 
