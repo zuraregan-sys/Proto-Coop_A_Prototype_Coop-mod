@@ -1224,7 +1224,10 @@ static void* FindDrawableArchetype(unsigned int hash)
 static void SendModel()
 {
     if (!g_syncModel || g_socket == INVALID_SOCKET) return;
-    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    // The preload runs on the puppet: it is a disposable copy with the same
+    // transformation descriptions, so loading the models never touches the
+    // local player (its model, power selection and drawable stay untouched).
+    void* player = g_puppetObject;
     if (player == nullptr) return;
     void* render = FindBehaviourByName(player, "RenderBehaviour");
     if (render == nullptr) return;
@@ -1245,41 +1248,6 @@ static void SendModel()
     sendto(g_socket, reinterpret_cast<const char*>(packet), 10, 0, reinterpret_cast<sockaddr*>(&g_peer),
         sizeof(g_peer));
     Log("model send: %08X%08X", (unsigned int)(value >> 32), (unsigned int)value);
-}
-
-// Swaps the character model of an object for the archetype of that name hash,
-// keeping the pose it already has (the one the stream writes for the puppet and
-// the one the game animates for the player).
-static void SetObjectModel(void* object, unsigned int hash)
-{
-    if (object == nullptr || hash == 0) return;
-    void* render = FindBehaviourByName(object, "RenderBehaviour");
-    if (render == nullptr) return;
-    if (ReadU32(render, 0x18) == hash) return;
-    void* archetype = FindDrawableArchetype(hash);
-    if (archetype == nullptr) return;
-    unsigned int sourceDrawable = ReadU32(archetype, 8);
-    if (ReadU32(archetype, 0) != 0x10E6E394 || !Plausible(reinterpret_cast<void*>(sourceDrawable))) return;
-    unsigned int poseAttribute = ReadU32(render, 0xC);
-    using CreateInstanceFn = void (__cdecl*)(void*, void*, unsigned char, unsigned char);
-    unsigned char created[16] = { 0 };
-    reinterpret_cast<CreateInstanceFn>(At<void*>(0x007ED5F0))(created, archetype, 1,
-        poseAttribute != 0 ? 1 : 0);
-    unsigned int handle = *(unsigned int*)created;
-    if (handle == 0xFFFFFFFF) return;
-    const void* localName = reinterpret_cast<const void* (__thiscall*)(void*)>(At<void*>(0x008258B0))(archetype);
-    unsigned int oldPose = GetAttributeValue(object, 0x10E80688);
-    reinterpret_cast<void (__thiscall*)(void*, unsigned int, const void*)>(At<void*>(0x00862C30))(
-        render, handle, localName != nullptr ? localName : g_remoteModel);
-    if (oldPose != 0 && Plausible(reinterpret_cast<void*>(oldPose)) &&
-        ReadU32(reinterpret_cast<void*>(oldPose), 0x14) == 67)
-    {
-        reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006E2A70))(reinterpret_cast<void*>(oldPose));
-        reinterpret_cast<void (__thiscall*)(void*, void*)>(At<void*>(0x00862600))(render, reinterpret_cast<void*>(oldPose));
-        reinterpret_cast<void (__thiscall*)(const void*, void*)>(At<void*>(0x007EDA80))(
-            reinterpret_cast<const void*>(&handle), reinterpret_cast<void*>(oldPose));
-        reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006E2A80))(reinterpret_cast<void*>(oldPose));
-    }
 }
 
 static void ApplyModel()
@@ -1903,7 +1871,6 @@ static void PreloadTick()
     static int holdTries = 0;
     static bool saved = false;
     static unsigned int savedDesired = 0;
-    static unsigned int savedModel = 0;
     static bool finished = false;
     static const unsigned int huds[5] = { 1, 2, 3, 4, 5 };
     unsigned int now = GetTickCount();
@@ -1923,8 +1890,6 @@ static void PreloadTick()
     {
         saved = true;
         savedDesired = ReadU32(reinterpret_cast<void*>(slots), 0x08);
-        void* render = FindBehaviourByName(player, "RenderBehaviour");
-        savedModel = render != nullptr ? ReadU32(render, 0x18) : 0;
     }
 
     // Keep a reference to the model of the power started in the previous step
@@ -1974,13 +1939,8 @@ static void PreloadTick()
             restore, slotName, restoreName, false);
         reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(player, restore);
         *reinterpret_cast<unsigned int*>(slots + 0x08) = savedDesired;
-        // Setting the desired description also changed the character model:
-        // put the player's own model back before anything is replicated.
-        SetObjectModel(player, savedModel);
-        Log("preload: restored desired=%08X model=%08X (saved %08X/%08X)",
-            ReadU32(reinterpret_cast<void*>(slots), 0x08),
-            ReadU32(reinterpret_cast<void*>(FindBehaviourByName(player, "RenderBehaviour")), 0x18),
-            savedDesired, savedModel);
+        Log("preload: restored desired=%08X (saved %08X)",
+            ReadU32(reinterpret_cast<void*>(slots), 0x08), savedDesired);
         for (int k = 0; k < 5; ++k)
         {
             unsigned int found = 0;
