@@ -34,10 +34,23 @@ del snapshot, sin cuelgues ni crashes.
 - Sin supresion del mundo local: en la zona comun cada jugador ve sus NPCs y las
   copias del otro (duplicados). Es el siguiente problema a resolver.
 
-## Siguiente
+## Hecho despues de la primera pasada
 
-- Evitar duplicados: repartir la autoridad por distancia (cada lado simula lo
-  suyo y el otro no lo pinta) o congelar los NPCs locales que el peer tambien
-  envia.
-- Vehiculos (111 en 300 m en Times Square) y animacion de las copias.
-- Save compartido para dos PCs y carpeta de saves propia del online.
+- [x] 9. Evitar duplicados: no se envia ningun actor a menos de `city_near` (60 m)
+      del peer; en la zona comun no hay copias dobles. Verificado: con los dos
+      jugadores juntos se envian solo 2-10 actores lejanos en vez de 24.
+- [x] 10. Vehiculos: hasta 8 por snapshot, con el mismo camino (plantilla,
+      copia estatica, puerta por distancia).
+- [x] 11. Save compartido para dos PCs: `tools/sync-save.ps1` copia los
+      `slot-*.bin` del host al cliente con verificacion de hash y respaldo.
+
+## Pendiente (requiere investigacion de motor)
+
+- [ ] Animar las copias de la ciudad (pose de los mas cercanos o idle propio).
+- [ ] Latigo en el actor remoto y su tendril (el contenido no admite dos actores).
+- [ ] Efectos anclados y motion trails.
+- [ ] Disfraz.
+- [ ] Armas en el suelo y vehiculos para los jugadores.
+- [ ] Salud/dano y agarres entre jugadores.
+- [ ] Modo historia, menu coop y polish (desync, ritmo de paquetes).
+- Sincronizacion de enemigos y bosses

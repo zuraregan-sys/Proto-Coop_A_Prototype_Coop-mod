@@ -101,6 +101,7 @@ static bool g_whipPuppet = false;
 static bool g_puppetNoChoreo = true;
 static bool g_cityCensus = false;
 static int g_cityRadius = 300;
+static int g_cityNear = 60;
 static bool g_cityOn = false;
 static unsigned int g_citySendCount = 0;
 static unsigned int g_cityRecvCount = 0;
@@ -230,6 +231,7 @@ static void ReadConfig()
     g_puppetNoChoreo = GetPrivateProfileIntA("coop", "puppet_nochoreo", 1, path) != 0;
     g_cityCensus = GetPrivateProfileIntA("coop", "city_census", 0, path) != 0;
     g_cityRadius = GetPrivateProfileIntA("coop", "city_radius", 300, path);
+    g_cityNear = GetPrivateProfileIntA("coop", "city_near", 60, path);
     if (g_cityRadius < 20) g_cityRadius = 20;
     g_luaPowers = GetPrivateProfileIntA("coop", "lua_powers", 1, path) != 0;
     g_dumpLua = GetPrivateProfileIntA("coop", "dump_lua", 0, path) != 0;
@@ -3317,6 +3319,11 @@ static int CollectCityEntries(CityEntry* entries, int max)
         if (!ReadObjectPosition(object, &x, &y, &z)) continue;
         float dx = x - px, dy = y - py, dz = z - pz;
         if (dx * dx + dy * dy + dz * dz > radius2) continue;
+        // The actor already lives in the peer's world when it is close to the
+        // peer; sending it would only draw a second copy next to the local one.
+        float ex = x - g_remoteX, ey = y - g_remoteY, ez = z - g_remoteZ;
+        float keepOut = static_cast<float>(g_cityNear);
+        if (ex * ex + ey * ey + ez * ez < keepOut * keepOut) continue;
         if (ObjectKind(object) != OBJECT_CHARACTER) continue;
         void* tmpl = LookupTemplate(object);
         if (tmpl == nullptr) continue;
@@ -3333,6 +3340,37 @@ static int CollectCityEntries(CityEntry* entries, int max)
         entry.yaw = 0;
         ++count;
     }
+    // Vehicles fill the leftover room, a few per snapshot, with the same rule:
+    // only the ones the peer does not have around it.
+    int vehicles = 0;
+    for (unsigned int i = 0; i < 0x1800 && count < max && vehicles < 8; ++i)
+    {
+        void* object = reinterpret_cast<void*>(ReadU32(reinterpret_cast<void*>(table), i * 8));
+        if (!Plausible(object) || object == player || object == g_puppetObject) continue;
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        if (!ReadObjectPosition(object, &x, &y, &z)) continue;
+        float dx = x - px, dy = y - py, dz = z - pz;
+        if (dx * dx + dy * dy + dz * dz > radius2) continue;
+        float ex = x - g_remoteX, ey = y - g_remoteY, ez = z - g_remoteZ;
+        float keepOut = static_cast<float>(g_cityNear);
+        if (ex * ex + ey * ey + ez * ez < keepOut * keepOut) continue;
+        if (ObjectKind(object) != OBJECT_VEHICLE) continue;
+        void* tmpl = LookupTemplate(object);
+        if (tmpl == nullptr) continue;
+        unsigned int hash = ReadU32(tmpl, 0x10);
+        if (hash == 0) continue;
+        unsigned int id = ObjectHandleId(object);
+        if (id == 0) continue;
+        CityEntry& entry = entries[count];
+        entry.id = id;
+        entry.hash = hash;
+        entry.qx = static_cast<short>(x * 8.0f);
+        entry.qy = static_cast<short>(y * 8.0f);
+        entry.qz = static_cast<short>(z * 8.0f);
+        entry.yaw = 1; // marks a vehicle for the log
+        ++count;
+        ++vehicles;
+    }
     return count;
 }
 
@@ -3341,7 +3379,17 @@ static void SendCitySnapshot()
     if (g_socket == INVALID_SOCKET) return;
     CityEntry entries[CITY_MAX];
     int count = CollectCityEntries(entries, CITY_MAX);
-    if (count <= 0) return;
+    if (count <= 0)
+    {
+        static unsigned int idleLog = 0;
+        unsigned int now = GetTickCount();
+        if (now - idleLog > 15000)
+        {
+            idleLog = now;
+            Log("city: idle (no character beyond %d m from the peer)", g_cityNear);
+        }
+        return;
+    }
     unsigned char packet[6 + CITY_MAX * CITY_ENTRY_BYTES];
     packet[0] = 'C';
     packet[1] = '1';

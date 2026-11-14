@@ -45,13 +45,17 @@ Overall                                ############--------  61%
 ### City replication
 
 While the two players are within 150 m of each other (the stream stops at 200 m),
-each side sends the characters it has within `city_radius` (32 at most, 4 Hz) as
-`C1` packets: sender id, template hash, quantized position and facing. The peer
-resolves the template by hash in its own content and spawns a visual copy with
-every behaviour except the render one switched off, so it cannot fight, move on
-its own or run mission code. Copies that stop arriving are moved out of sight and
-their slot is reused. The local city is **not** suppressed yet, so in the shared
-area both players see their own characters plus the peer's copies.
+each side sends the characters and a few vehicles it has within `city_radius`
+(32 entries at most, 4 Hz) as `C1` packets: sender id, template hash, quantized
+position and facing. The peer resolves the template by hash in its own content and
+spawns a visual copy with every behaviour except the render one switched off, so
+it cannot fight, move on its own or run mission code. Copies that stop arriving
+are moved out of sight and their slot is reused.
+
+Actors closer than `city_near` (60 m) to the **peer** are never sent: they already
+live in its world, so skipping them is what keeps the shared area free of double
+NPCs. The copies are still static (no animation); when the players separate, each
+one sees the other's surroundings populated.
 
 ## How it works right now (for testing)
 
@@ -106,6 +110,7 @@ whip_puppet=0        ; 1 = also apply the whip to the puppet (crashes: engine li
 puppet_nochoreo=1    ; 1 = keep the avatar out of the engine's animation jobs (default)
 city_radius=300      ; stream the characters around each player within this radius
 city_census=0        ; 1 = log the city composition around the player every 2 s
+city_near=60         ; actors this close to the peer are not mirrored (no duplicates)
 ```
 
 ## Building
@@ -117,6 +122,17 @@ Requires the 32-bit MinGW toolchain used by the project (`tools\build-coop.ps1`)
 ```
 
 Outputs `build\coop\prototype_coop.asi` and `build\coop\xinput1_3.dll`.
+
+## Saves
+
+On one PC both instances share `%USERPROFILE%\Documents\Prototype`, so they
+already start with the same progress. For two PCs, `tools\sync-save.ps1` copies
+the host's `slot-*.bin` files into the client's save folder (hash checked, the
+client's previous files are kept in `Backup\saves-<time>`):
+
+```powershell
+.\tools\sync-save.ps1 -From "C:\Users\me\Documents\Prototype" -To "\\HOST\PrototypeSaves"
+```
 
 ## Testing
 
@@ -130,16 +146,17 @@ The repository keeps two prepared copies of the game in `TestInstances\0` and
 
 ## Roadmap
 
-1. Whip Fist: give the remote puppet a whip representation that does not load the arm
+1. Animate the city copies (stream the nearest few poses, or let them run an idle).
+2. Whip Fist: give the remote puppet a whip representation that does not load the arm
    content twice (the engine cannot share it between two actors), and replicate the
    tendril that connects the blade to the arm.
-2. Effects: world effects (ground spikes, explosions) are replicated; attached effects and
+3. Effects: world effects (ground spikes, explosions) are replicated; attached effects and
    motion trails still duplicate or crash when replayed.
-3. Disguise subsystem.
-4. Vehicles and weapons.
-5. Story mode.
-6. Health / damage / grab interactions between players (optional, likely annoying).
-7. Polish: stability, packet rate, desync recovery, co-op menu.
+4. Disguise subsystem.
+5. Weapons on the ground and vehicles for the players.
+6. Story mode.
+7. Health / damage / grab interactions between players (optional, likely annoying).
+8. Polish: stability, packet rate, desync recovery, co-op menu.
 
 ## Notes
 
