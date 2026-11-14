@@ -89,6 +89,14 @@ static void* g_slowRequest = nullptr;
 static bool g_syncModel = true;
 static bool g_preloadPowers = false;
 static bool g_dumpAnim = false;
+static bool g_dumpMotion = false;
+static bool g_syncTrails = false;
+static bool g_localWhipUsed = false;
+static bool g_luaPowers = true;
+static bool g_dumpLua = false;
+static void* g_dbSetInt = nullptr;
+static bool g_whipPuppet = false;
+static volatile long g_luaWindowUntil = 0;
 static bool g_forceSwap = false;
 static bool g_transformStart = false;
 static unsigned char g_localModel[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
@@ -206,6 +214,11 @@ static void ReadConfig()
     g_syncModel = GetPrivateProfileIntA("coop", "sync_model", 1, path) != 0;
     g_preloadPowers = GetPrivateProfileIntA("coop", "preload_powers", 0, path) != 0;
     g_dumpAnim = GetPrivateProfileIntA("coop", "dump_anim", 0, path) != 0;
+    g_dumpMotion = GetPrivateProfileIntA("coop", "dump_motion", 0, path) != 0;
+    g_syncTrails = GetPrivateProfileIntA("coop", "sync_trails", 0, path) != 0;
+    g_whipPuppet = GetPrivateProfileIntA("coop", "whip_puppet", 0, path) != 0;
+    g_luaPowers = GetPrivateProfileIntA("coop", "lua_powers", 1, path) != 0;
+    g_dumpLua = GetPrivateProfileIntA("coop", "dump_lua", 0, path) != 0;
     g_forceSwap = GetPrivateProfileIntA("coop", "force_swap", 0, path) != 0;
     g_transformStart = GetPrivateProfileIntA("coop", "transform_start", 0, path) != 0;
     g_testMass = (float)GetPrivateProfileIntA("coop", "test_mass", 0, path);
@@ -1233,7 +1246,9 @@ static void* FindDrawableArchetype(unsigned int hash)
 // power's arm mesh is drawn on top of its normal one (four arms).
 static void SendModel()
 {
-    if (!g_syncModel || g_socket == INVALID_SOCKET) return;
+    // The transformation system already swaps the puppet's model: the manual
+    // archetype swap only covers sessions where the scripts are unavailable.
+    if (g_luaPowers || !g_syncModel || g_socket == INVALID_SOCKET) return;
     void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     if (player == nullptr) return;
     void* render = FindBehaviourByName(player, "RenderBehaviour");
@@ -1242,6 +1257,7 @@ static void SendModel()
     memcpy(name, reinterpret_cast<unsigned char*>(render) + 0x18, 8);
     unsigned long long value = 0;
     memcpy(&value, name, 8);
+    if (ReadU32(name, 0) == 0x5E358819) g_localWhipUsed = true;
     if (g_localModelValid && memcmp(name, g_localModel, 8) == 0) return;
     unsigned int now = GetTickCount();
     if (now - g_lastModelSend < 100) return;
@@ -1258,10 +1274,16 @@ static void SendModel()
         (unsigned int)value, (unsigned int)player, (unsigned int)render, ReadU32(render, 4));
 }
 
+static bool IsPowerWheelOpen(void* player);
+
 static void ApplyModel()
 {
-    if (!g_syncModel || !g_remoteModelValid) return;
+    if (g_luaPowers || !g_syncModel || !g_remoteModelValid) return;
     if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
+    // Do not rebuild drawables while the local power wheel is open: the game is
+    // rebuilding the same render state for the interface.
+    void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if (localPlayer != nullptr && IsPowerWheelOpen(localPlayer)) return;
     if (g_appliedModelValid && memcmp(g_remoteModel, g_appliedModel, 8) == 0)
     {
         // The game can reset the puppet's model (a respawn, a transformation
@@ -1371,8 +1393,11 @@ static void ApplyModel()
         reinterpret_cast<void (__thiscall*)(const void*, void*)>(At<void*>(0x007EDA80))(
             reinterpret_cast<const void*>(&handle), pose);
     }
-    if (reusePose)
-        reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x006E2A80))(reinterpret_cast<void*>(oldPose));
+    // The extra reference taken above is deliberately not released: dropping it
+    // after the swap let the pose be freed while the render behaviour still
+    // used it (a later PoseData::FreeMemory fault). One reference per swap is
+    // cheap and keeps the pose alive for the session.
+    (void)reusePose;
     memcpy(g_appliedModel, g_remoteModel, 8);
     g_appliedModelValid = true;
     unsigned int poseNow = GetAttributeValue(g_puppetObject, 0x10E80688);
@@ -1470,8 +1495,65 @@ static LONG WINAPI UnhandledExceptionFilterLog(EXCEPTION_POINTERS* info)
     if (info != nullptr && info->ExceptionRecord != nullptr)
     {
         EXCEPTION_RECORD* record = info->ExceptionRecord;
-        Log("unhandled: code=%08X address=%p flags=%08X", record->ExceptionCode,
-            record->ExceptionAddress, record->ExceptionFlags);
+        Log("unhandled: code=%08X address=%p rva=%06X flags=%08X", record->ExceptionCode,
+            record->ExceptionAddress,
+            g_engine != nullptr ? reinterpret_cast<unsigned int>(record->ExceptionAddress) -
+                reinterpret_cast<unsigned int>(g_engine) : 0,
+            record->ExceptionFlags);
+        if (info->ContextRecord != nullptr && g_engine != nullptr)
+        {
+            unsigned int base = reinterpret_cast<unsigned int>(g_engine);
+            unsigned int esp = info->ContextRecord->Esp;
+            unsigned int ebp = info->ContextRecord->Ebp;
+            char text[600];
+            int used = 0;
+            text[0] = 0;
+            for (int i = 0; i < 14 && ebp > esp && ebp < esp + 0x20000 && (ebp & 3) == 0; ++i)
+            {
+                unsigned int caller = ReadU32(reinterpret_cast<void*>(ebp), 4);
+                int added = 0;
+                if (caller >= base && caller < base + 0x2000000)
+                    added = sprintf_s(text + used, sizeof(text) - used, " %06X", caller - base);
+                else
+                    added = sprintf_s(text + used, sizeof(text) - used, " ??????");
+                if (added <= 0) break;
+                used += added;
+                unsigned int next = ReadU32(reinterpret_cast<void*>(ebp), 0);
+                if (next <= ebp || next >= base + 0x2000000) break;
+                ebp = next;
+            }
+            Log("stack ebp:%s", text);
+            // Scan only the committed part of the current stack region.
+            unsigned int end = esp + 0x400;
+            MEMORY_BASIC_INFORMATION region;
+            if (VirtualQuery(reinterpret_cast<void*>(esp), &region, sizeof(region)) != 0 &&
+                region.State == MEM_COMMIT)
+            {
+                unsigned int regionEnd = reinterpret_cast<unsigned int>(region.BaseAddress) + region.RegionSize;
+                if (regionEnd < end) end = regionEnd;
+            }
+            else
+            {
+                end = esp;
+            }
+            used = 0;
+            text[0] = 0;
+            for (unsigned int p = esp; p + 4 <= end && used < 480; p += 4)
+            {
+                unsigned int value = *reinterpret_cast<unsigned int*>(p);
+                if (value < base || value >= base + 0x2000000) continue;
+                int added = sprintf_s(text + used, sizeof(text) - used, " %06X", value - base);
+                if (added <= 0) break;
+                used += added;
+            }
+            Log("stack raw:%s", text);
+        }
+        if (record->ExceptionCode == 0xC0000005 && record->NumberParameters >= 2)
+        {
+            const char* kind = record->ExceptionInformation[0] == 0 ? "read" :
+                (record->ExceptionInformation[0] == 1 ? "write" : "exec");
+            Log("unhandled: %s at %p", kind, reinterpret_cast<void*>(record->ExceptionInformation[1]));
+        }
         if (record->ExceptionCode == 0xE06D7363 && record->NumberParameters >= 3)
         {
             // MSVC C++ exception: [0] magic, [1] thrown object, [2] ThrowInfo.
@@ -1546,7 +1628,36 @@ static bool __attribute__((force_align_arg_pointer)) __thiscall HookActionStart(
 
 static bool __attribute__((force_align_arg_pointer)) __thiscall HookMotionTrail(void* self, int arg, float value)
 {
-    return false;
+    bool result = reinterpret_cast<bool (__thiscall*)(void*, int, float)>(g_motionTrail)(self, arg, value);
+    if (g_dumpMotion)
+    {
+        static int logged = 0;
+        if (logged++ < 20)
+            Log("motion: self=%08X link=%08X target38=%08X arg=%d val=%.2f result=%d",
+                (unsigned int)self, ReadU32(self, 0x1C), ReadU32(self, 0x38), arg, value, result ? 1 : 0);
+    }
+    if (g_syncTrails && g_transportReady && g_socket != INVALID_SOCKET)
+    {
+        // The trail belongs to the local player when its target handle matches.
+        unsigned int target = ReadU32(self, 0x38);
+        unsigned int playerHandle = g_engine != nullptr ? ReadU32(g_engine, 0x126E40C) : 0xFFFF;
+        if (target != 0xFFFF && target == playerHandle)
+        {
+            // Slot5 runs every update of the trail: forward each action once.
+            static void* seen[32];
+            static int seenCount = 0;
+            bool known = false;
+            for (int i = 0; i < seenCount; ++i)
+                if (seen[i] == self) { known = true; break; }
+            if (!known)
+            {
+                if (seenCount < 32) seen[seenCount++] = self;
+                void* track = reinterpret_cast<void*>(ReadU32(self, 0x1C));
+                if (track != nullptr) SendMotionTrail(track);
+            }
+        }
+    }
+    return result;
 }
 
 static void* __attribute__((force_align_arg_pointer)) __thiscall HookStartEffect(void* self, void* out, const void* name, void* setup)
@@ -1720,6 +1831,10 @@ static int ReadTransformSlots(void* object, TransformSlotState* out, int max)
         if (g_dumpTransform && out[i].active)
         {
             unsigned int description = *(unsigned int*)(slot + 0x0C);
+            unsigned long long desiredHash, activeHash;
+            memcpy(&desiredHash, out[i].desired, 8);
+            memcpy(&activeHash, out[i].activeDescription, 8);
+            Log("transform hashes: desired=%016llX active=%016llX", desiredHash, activeHash);
             if (Plausible(reinterpret_cast<void*>(description)))
                 Log("transform desc: slot=%08X/%08X drawable=%08X body=%08X left=%08X needed=%d power=%d hud=%d",
                     out[i].slot[0], out[i].slot[1], ReadU32(reinterpret_cast<void*>(description), 0x18),
@@ -2021,8 +2136,397 @@ static void PreloadTick()
     ++next;
 }
 
+// The engine publishes the form a character wears into the HUD quick-select
+// database value ("HUDPlayerTransform", player 0, index = power slot). A form
+// applied to the puppet publishes too, and the HUD then equips it on the local
+// player. While a puppet power is being applied, drop those writes so only the
+// player's own selections reach the interface.
+static void __attribute__((force_align_arg_pointer)) __thiscall HookDbSetInt(void* self, const void* name,
+    unsigned int player, int value, unsigned int index)
+{
+    bool hud = name == At<void*>(0x0126CB90);
+    if (hud)
+    {
+        unsigned int caller = reinterpret_cast<unsigned int>(__builtin_return_address(0)) -
+            reinterpret_cast<unsigned int>(g_engine);
+        if (g_dumpLua)
+            Log("db: HUD transform value=%d slot=%u player=%u caller=%06X window=%d", value, index, player,
+                caller, g_luaWindowUntil != 0 && GetTickCount() < (unsigned int)g_luaWindowUntil ? 1 : 0);
+        // Only the transformation handler publishes the form a character wears
+        // (RVA 0x827D9); the player's own wheel selections come from elsewhere
+        // and must still reach the interface.
+        if (caller == 0x000827D9 && g_luaWindowUntil != 0 && GetTickCount() < (unsigned int)g_luaWindowUntil)
+            return;
+
+    }
+    reinterpret_cast<void (__thiscall*)(void*, const void*, unsigned int, int, unsigned int)>(g_dbSetInt)(
+        self, name, player, value, index);
+}
+
+// The engine's own script runtime: the stock Lua helpers change an actor's
+// transformation slots by name. Everything crosses processes as the name hash
+// the slots already carry, so each side resolves its own description objects.
+static unsigned long long NameHash(const char* text)
+{
+    unsigned long long value = 0;
+    for (; *text != 0; ++text)
+        value = value * 0x1003F ^ static_cast<unsigned char>(*text);
+    return value;
+}
+
+static char g_luaPowerNames[96][48];
+static int g_luaPowerNameCount = 0;
+static bool g_luaCatalogLoaded = false;
+
+static void AddLuaPowerName(const char* text)
+{
+    if (text == nullptr || text[0] == 0) return;
+    if (strlen(text) >= 48) return;
+    for (int i = 0; i < g_luaPowerNameCount; ++i)
+        if (strcmp(g_luaPowerNames[i], text) == 0) return;
+    if (g_luaPowerNameCount < 96)
+        strcpy_s(g_luaPowerNames[g_luaPowerNameCount++], 48, text);
+}
+
+static int LuaType(void* L, int index)
+{
+    return reinterpret_cast<int (__cdecl*)(void*, int)>(At<void*>(0x0062C370))(L, index);
+}
+
+static const char* LuaToString(void* L, int index)
+{
+    return reinterpret_cast<const char* (__cdecl*)(void*, int, unsigned int*)>(At<void*>(0x0062C610))(L, index, nullptr);
+}
+
+static int LuaNext(void* L, int index)
+{
+    return reinterpret_cast<int (__cdecl*)(void*, int)>(At<void*>(0x0062D200))(L, index);
+}
+
+static void LuaGetField(void* L, int index, const char* key)
+{
+    reinterpret_cast<void (__cdecl*)(void*, int, const char*)>(At<void*>(0x0062CA40))(L, index, key);
+}
+
+static void LuaPushNil(void* L)
+{
+    reinterpret_cast<void (__cdecl*)(void*)>(At<void*>(0x0062C7D0))(L);
+}
+
+static void LuaPushString(void* L, const char* text)
+{
+    reinterpret_cast<void (__cdecl*)(void*, const char*)>(At<void*>(0x0062C870))(L, text);
+}
+
+static void LuaPushBool(void* L, bool value)
+{
+    reinterpret_cast<void (__cdecl*)(void*, int)>(At<void*>(0x0062C9A0))(L, value ? 1 : 0);
+}
+
+static void LuaPushHandle(void* L, unsigned int handle)
+{
+    reinterpret_cast<void (__cdecl*)(void*, void*)>(At<void*>(0x0062C9C0))(L, reinterpret_cast<void*>(handle));
+}
+
+static void LuaSetTop(void* L, int top)
+{
+    reinterpret_cast<void (__cdecl*)(void*, int)>(At<void*>(0x0062C1C0))(L, top);
+}
+
+static int LuaGetTop(void* L)
+{
+    return reinterpret_cast<int (__cdecl*)(void*)>(At<void*>(0x0062C1B0))(L);
+}
+
+static int LuaToBool(void* L, int index)
+{
+    return reinterpret_cast<int (__cdecl*)(void*, int)>(At<void*>(0x0062C5E0))(L, index);
+}
+
+static int LuaProtectedCall(void* L, int arguments, int results)
+{
+    return reinterpret_cast<int (__cdecl*)(void*, int, int)>(At<void*>(0x007FFB10))(L, arguments, results);
+}
+
+// LUA_GLOBALSINDEX in Lua 5.1; the game's scripts are Lua 5.1 as well.
+enum { LuaGlobalsIndex = -10002, LuaTableType = 5, LuaStringType = 4, LuaFunctionType = 6 };
+
+static void CollectLuaNames(void* L, int depth)
+{
+    int type = LuaType(L, -1);
+    if (type == LuaStringType)
+    {
+        const char* text = LuaToString(L, -1);
+        if (text != nullptr)
+        {
+            AddLuaPowerName(text);
+            if (g_dumpLua) Log("lua: name \"%s\" %016llX", text, NameHash(text));
+        }
+        return;
+    }
+    if (type != LuaTableType || depth >= 3) return;
+    LuaPushNil(L);
+    while (LuaNext(L, -2) != 0)
+    {
+        if (LuaType(L, -2) == LuaStringType)
+        {
+            const char* key = LuaToString(L, -2);
+            if (key != nullptr) AddLuaPowerName(key);
+        }
+        CollectLuaNames(L, depth + 1);
+        LuaSetTop(L, -2);
+    }
+}
+
+static bool LoadLuaPowerCatalog(void* L)
+{
+    static const char* const globals[] = { "powersList", "HUD_POWERS", "HUD_TRANSFORM_SLOT" };
+    int top = LuaGetTop(L);
+    bool found = false;
+    for (int i = 0; i < 3; ++i)
+    {
+        LuaGetField(L, LuaGlobalsIndex, globals[i]);
+        int type = LuaType(L, -1);
+        if (type == LuaTableType)
+        {
+            if (g_dumpLua) Log("lua: table %s", globals[i]);
+            found = true;
+            CollectLuaNames(L, 0);
+        }
+        else if (g_dumpLua)
+        {
+            Log("lua: table %s missing (type %d)", globals[i], type);
+        }
+        LuaSetTop(L, top);
+    }
+    // The stock names, in case the tables are not exposed yet.
+    // The transformation descriptions are named Alex<Power> (the slots seen in
+    // game hash to AlexBlades, AlexHammerFist and AlexWhipFist), so both forms
+    // are candidate names.
+    static const char* const known[] = { "Claws", "Blades", "Blade", "HammerFist", "WhipFist",
+        "MuscleMass", "Shield", "Armor", "Armour", "AlexClaws", "AlexBlades", "AlexBlade",
+        "AlexHammerFist", "AlexWhipFist", "AlexMuscleMass", "AlexShield", "AlexArmor", "AlexArmour" };
+    for (int i = 0; i < 18; ++i) AddLuaPowerName(known[i]);
+    if (g_dumpLua) Log("lua: catalog has %d names", g_luaPowerNameCount);
+    return found;
+}
+
+// The tables appear when the game scripts run; retry until one is there.
+static void LoadLuaPowerCatalogIfReady()
+{
+    static unsigned int lastTry = 0;
+    unsigned int now = GetTickCount();
+    if (lastTry != 0 && now - lastTry < 2000) return;
+    lastTry = now;
+    void* manager = *reinterpret_cast<void**>(At<void*>(0x01284254));
+    if (!Plausible(manager)) return;
+    void* L = reinterpret_cast<void*>(ReadU32(manager, 0x0C));
+    if (!Plausible(L)) return;
+    g_luaCatalogLoaded = LoadLuaPowerCatalog(L);
+}
+
+static const char* LuaPowerName(unsigned long long hash)
+{
+    for (int i = 0; i < g_luaPowerNameCount; ++i)
+        if (NameHash(g_luaPowerNames[i]) == hash) return g_luaPowerNames[i];
+    return nullptr;
+}
+
+static int PowerHud(const char* name)
+{
+    static const struct { const char* name; int hud; } powers[] = {
+        { "AlexClaws", 1 }, { "AlexBlades", 2 }, { "AlexHammerFist", 3 }, { "AlexWhipFist", 4 },
+        { "AlexMuscleMass", 5 }, { "AlexArmor", 6 }, { "AlexShield", 8 } };
+    for (int i = 0; i < 7; ++i)
+        if (strcmp(powers[i].name, name) == 0) return powers[i].hud;
+    return 0;
+}
+
+static const char* TransformSlotString(const unsigned int* slot)
+{
+    static unsigned long long attack = 0;
+    static unsigned long long defense = 0;
+    if (attack == 0)
+    {
+        attack = NameHash("Attack");
+        defense = NameHash("Defense");
+    }
+    unsigned long long value;
+    memcpy(&value, slot, 8);
+    if (value == attack) return "Attack";
+    if (value == defense) return "Defense";
+    return nullptr;
+}
+
+static bool LuaCallSetDesired(void* L, unsigned int handle, const char* slot, const char* name)
+{
+    int top = LuaGetTop(L);
+    LuaGetField(L, LuaGlobalsIndex, "go_SetDesiredTransformation");
+    if (LuaType(L, -1) != LuaFunctionType)
+    {
+        LuaSetTop(L, top);
+        return false;
+    }
+    LuaPushHandle(L, handle);
+    LuaPushString(L, slot);
+    LuaPushString(L, name);
+    LuaPushBool(L, false);
+    bool result = false;
+    if (LuaProtectedCall(L, 4, 1) == 0) result = LuaToBool(L, -1) != 0;
+    LuaSetTop(L, top);
+    return result;
+}
+
+static bool LuaCallEnableSlot(void* L, unsigned int handle, const char* slot, bool enabled)
+{
+    int top = LuaGetTop(L);
+    LuaGetField(L, LuaGlobalsIndex, "go_EnableTransformationForSlot");
+    if (LuaType(L, -1) != LuaFunctionType)
+    {
+        LuaSetTop(L, top);
+        return false;
+    }
+    LuaPushHandle(L, handle);
+    LuaPushString(L, slot);
+    LuaPushBool(L, enabled);
+    bool result = false;
+    if (LuaProtectedCall(L, 3, 1) == 0) result = LuaToBool(L, -1) != 0;
+    LuaSetTop(L, top);
+    return result;
+}
+
+// What the puppet was last told through the scripts, keyed by slot name.
+struct LuaAppliedPower
+{
+    unsigned long long slot;
+    unsigned long long description;
+    int hud;
+    bool active;
+};
+static LuaAppliedPower g_luaApplied[8];
+static int g_luaAppliedCount = 0;
+
+// True when the local player's own slots show that transformation active.
+static bool LocalPlayerWears(unsigned long long description)
+{
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if (player == nullptr) return false;
+    TransformSlotState state[8];
+    int count = ReadTransformSlots(player, state, 8);
+    for (int i = 0; i < count; ++i)
+    {
+        if (!state[i].active) continue;
+        unsigned long long desired, active;
+        memcpy(&desired, state[i].desired, 8);
+        memcpy(&active, state[i].activeDescription, 8);
+        if (desired == description || active == description) return true;
+    }
+    return false;
+}
+
+static void ApplyLuaTransformState(const TransformSlotState* state, int count, bool force)
+{
+    if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
+    void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if (localPlayer != nullptr && IsPowerWheelOpen(localPlayer)) return;
+    if (g_localTransformTick != 0 && GetTickCount() - g_localTransformTick < 2000) return;
+    void* manager = *reinterpret_cast<void**>(At<void*>(0x01284254));
+    if (!Plausible(manager)) return;
+    void* L = reinterpret_cast<void*>(ReadU32(manager, 0x0C));
+    if (!Plausible(L)) return;
+    if (!g_luaCatalogLoaded) LoadLuaPowerCatalogIfReady();
+    // The scripts take the engine's saved handle: index in the high half.
+    unsigned int handle = ((g_puppetHandle & 0xFFFF) << 16) | (g_puppetHandle >> 16);
+    for (int i = 0; i < count; ++i)
+    {
+        const char* slot = TransformSlotString(state[i].slot);
+        if (slot == nullptr) continue;
+        unsigned long long slotHash;
+        memcpy(&slotHash, state[i].slot, 8);
+        int applied = -1;
+        for (int k = 0; k < g_luaAppliedCount; ++k)
+            if (g_luaApplied[k].slot == slotHash) { applied = k; break; }
+        if (!state[i].active)
+        {
+            if (applied >= 0 && g_luaApplied[applied].active)
+            {
+                g_luaApplied[applied].active = false;
+                // The stock revert: an empty description name is "no power".
+                // Disabling the slot alone keeps the last model attached.
+                g_luaWindowUntil = GetTickCount() + 1500;
+                bool set = LuaCallSetDesired(L, handle, slot, "");
+                bool ok = LuaCallEnableSlot(L, handle, slot, false);
+                Log("lua: disable %s ok=%d set=%d", slot, ok ? 1 : 0, set ? 1 : 0);
+            }
+            continue;
+        }
+        unsigned long long description;
+        memcpy(&description, state[i].desired, 8);
+        const char* name = LuaPowerName(description);
+        if (name == nullptr)
+        {
+            memcpy(&description, state[i].activeDescription, 8);
+            name = LuaPowerName(description);
+        }
+        if (name == nullptr)
+        {
+            if (g_dumpLua)
+                Log("lua: no name for desired=%016llX active=%016llX",
+                    *reinterpret_cast<const unsigned long long*>(state[i].desired),
+                    *reinterpret_cast<const unsigned long long*>(state[i].activeDescription));
+            continue;
+        }
+        if (!force && applied >= 0 && g_luaApplied[applied].active &&
+            g_luaApplied[applied].description == description)
+            continue;
+        if (PowerHud(name) == 4 && !g_whipPuppet)
+        {
+            // The whip's arm content cannot be loaded twice in one process: once
+            // the puppet has worn it, the next whip equip (the local player's)
+            // builds a drawable from released content and faults on a null pose
+            // or a null shader. The puppet keeps its previous appearance instead.
+            // whip_puppet=1 re-enables the attempt.
+            if (applied >= 0 && g_luaApplied[applied].active) g_luaApplied[applied].active = false;
+            static bool loggedWhip = false;
+            if (!loggedWhip)
+            {
+                loggedWhip = true;
+                Log("lua: %s skipped on the puppet (whip_puppet=0)", slot);
+            }
+            continue;
+        }
+        g_luaWindowUntil = GetTickCount() + 1500;
+        // The transformation loads content, and content loading switches the
+        // thread's current heap while it runs. Keep the game's heap as it was
+        // before the call so later engine allocations do not land on a content
+        // heap that cannot serve them.
+        int previousHeap = reinterpret_cast<int (__cdecl*)()>(At<void*>(0x0063A6F0))();
+        bool set = LuaCallSetDesired(L, handle, slot, name);
+        bool enable = LuaCallEnableSlot(L, handle, slot, true);
+        reinterpret_cast<int (__cdecl*)(int)>(At<void*>(0x0063A710))(previousHeap);
+        if (applied < 0 && g_luaAppliedCount < 8)
+        {
+            applied = g_luaAppliedCount++;
+            g_luaApplied[applied].slot = slotHash;
+            g_luaApplied[applied].active = false;
+        }
+        if (applied >= 0)
+        {
+            g_luaApplied[applied].description = description;
+            g_luaApplied[applied].hud = PowerHud(name);
+            g_luaApplied[applied].active = true;
+        }
+        Log("lua: %s %s set=%d enable=%d (desired=%016llX)", slot, name, set ? 1 : 0, enable ? 1 : 0, description);
+    }
+}
+
 static void ApplyTransformState(const TransformSlotState* state, int count, bool force)
 {
+    if (g_luaPowers)
+    {
+        ApplyLuaTransformState(state, count, force);
+        return;
+    }
     if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
     void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     if (localPlayer != nullptr && IsPowerWheelOpen(localPlayer)) return;
@@ -2109,6 +2613,18 @@ static void SpawnRemoteMotionTrail(const unsigned char* data, int length)
 {
     if (length < 2 + 7 * 4 + 4 + 4 + 8 + 8 + 6 * 8 + 6 * 12 + 12) return;
     if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
+    // The trail's shader and joints are content the local game loads only when
+    // its own player uses the whip; creating it earlier crashes in the pose.
+    if (!g_localWhipUsed)
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            Log("trail: dropped (the whip has not been used locally yet)");
+        }
+        return;
+    }
     void* render = FindBehaviourByName(g_puppetObject, "RenderBehaviour");
     if (render == nullptr) return;
     unsigned int drawable = ReadU32(render, 0x14);
@@ -2292,6 +2808,7 @@ static void ResetCoopState()
     g_remoteBasisValid = false;
     g_lastAppliedSlotCount = 0;
     g_appliedModelValid = false;
+    g_luaAppliedCount = 0;
     g_attrDumped = false;
     g_puppetPlaced = false;
     // Keep the spawn records: the new player object was already recorded by the
@@ -2337,6 +2854,8 @@ static void FrameTick()
     // cached for the old one is stale.
     static void* lastPlayer = nullptr;
     void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if ((g_luaPowers || g_dumpLua) && !g_luaCatalogLoaded && localPlayer != nullptr)
+        LoadLuaPowerCatalogIfReady();
     ApplyModel();
     PreloadTick();
     if (g_dumpAnim && (g_updateCalls % 15) == 0)
@@ -2407,6 +2926,34 @@ static void FrameTick()
         {
             g_transportReady = InitSocket();
             Log("transport ready=%d", g_transportReady ? 1 : 0);
+        }
+    }
+    // The local player's own power, so the log shows what the engine is
+    // switching to on this side when a crash appears.
+    if (g_dumpLua && localPlayer != nullptr && (g_updateCalls % 3) == 0)
+    {
+        static TransformSlotState last[8];
+        static int lastCount = -1;
+        TransformSlotState state[8];
+        int count = ReadTransformSlots(localPlayer, state, 8);
+        bool changed = count != lastCount;
+        for (int i = 0; i < count && !changed; ++i)
+            if (memcmp(&state[i], &last[i], sizeof(TransformSlotState)) != 0) changed = true;
+        if (changed)
+        {
+            memcpy(last, state, sizeof(state));
+            lastCount = count;
+            for (int i = 0; i < count; ++i)
+            {
+                if (state[i].slot[0] != 0 && state[i].slot[1] != 0)
+                {
+                    unsigned long long desired, active;
+                    memcpy(&desired, state[i].desired, 8);
+                    memcpy(&active, state[i].activeDescription, 8);
+                    Log("local power: slot=%08X/%08X desired=%016llX active=%016llX on=%u", state[i].slot[0],
+                        state[i].slot[1], desired, active, state[i].active);
+                }
+            }
         }
     }
     if (g_started || g_transportReady)
@@ -2700,6 +3247,18 @@ static bool __attribute__((force_align_arg_pointer)) __thiscall HookSendMessage(
             if (id == 4 && self == player && !g_remoteTransformation)
                 g_localTransformTick = GetTickCount();
         }
+        if (type == 0x1E && (id == 0x22 || id == 0x23) && g_dumpLua)
+        {
+            void* action = reinterpret_cast<void*>(ReadU32(message, 0x0C));
+            void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+            const char* rtti = Plausible(action) ? RttiName(action) : nullptr;
+            Log("tendril: %s self=%p player=%p action=%p vtable=%08X rtti=%s", id == 0x22 ? "register" : "deregister",
+                self, player, action, Plausible(action) ? ReadU32(action, 0) : 0, rtti != nullptr ? rtti : "(none)");
+            if (Plausible(action))
+                Log("tendril words: %08X %08X %08X %08X %08X %08X %08X %08X", ReadU32(action, 0x04), ReadU32(action, 0x08),
+                    ReadU32(action, 0x0C), ReadU32(action, 0x10), ReadU32(action, 0x14), ReadU32(action, 0x18),
+                    ReadU32(action, 0x1C), ReadU32(action, 0x20));
+        }
     }
     return reinterpret_cast<bool (__thiscall*)(void*, void*)>(g_sendMessage)(self, message);
 }
@@ -2813,7 +3372,13 @@ static void InstallHooks()
         Install("SlowMotionManager::Request", At<void*>(0x002A68E0), (void*)&HookSlowRequest, (void**)&g_slowRequest);
     Install("EffectManager::StartEffect", At<void*>(0x0081E6B0), (void*)&HookStartEffect, (void**)&g_startEffect);
     Install("EffectAction::Slot5", At<void*>(0x008076B0), (void*)&HookActionStart, (void**)&g_actionStart);
-    // Install("MotionTrailAction::Slot5", At<void*>(0x00805D30), (void*)&HookMotionTrail, (void**)&g_motionTrail);
+    if (g_dumpMotion || g_syncTrails)
+        Install("MotionTrailAction::Slot5", At<void*>(0x00805D30), (void*)&HookMotionTrail, (void**)&g_motionTrail);
+    if (g_luaPowers)
+    {
+        Install("GameDatabase::SetInt", At<void*>(0x007F8680), (void*)&HookDbSetInt, (void**)&g_dbSetInt);
+    }
+
     g_drawableArchetypeCaster = reinterpret_cast<void*>(0x10D97DC4);
     g_archetypeGetName = At<void*>(0x008258B0);
     g_sendSyncMessage = At<SendSyncMessageFn>(0x00833790);

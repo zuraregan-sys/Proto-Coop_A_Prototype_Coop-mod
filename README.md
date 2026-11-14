@@ -1,7 +1,7 @@
-# Prototype Co-op — online co-op for Prototype (2009)
+# Prototype Co-op - online co-op for Prototype (2009)
 
 Online co-op for **Prototype (2009)** (Steam App ID `10150`): a second player joins your
-city, sees you move, transform and cast your powers — and you see them.
+city, sees you move, transform and cast your powers - and you see them.
 
 The mod is an **ASI plugin + input proxy**. It does **not** modify or ship any game file:
 the Steam installation is never touched, everything runs from the copies in `TestInstances\`.
@@ -16,39 +16,32 @@ Based on the [coop-anything](https://github.com/cranebeaker/coop-anything) resea
 ## Progress
 
 ```text
-Co-op core (transport, avatar, pose)   ████████████████████░░░░  82%
-Powers & transformations               █████████████████░░░░░░░  72%
-Effects (world + attached)             ███░░░░░░░░░░░░░░░░░░░░░  15%
-Stability / edge cases                 ████████████████░░░░░░░░  64%
-──────────────────────────────────────────────────────────────────
-Overall                                ███████████████░░░░░░░░░  58%
+Co-op core (transport, avatar, pose)   #################---  82%
+Powers & transformations               ###################-  92%
+Effects (world + attached)             ###-----------------  15%
+Stability / edge cases                 ##############------  64%
+==================================================================
+Overall                                ############--------  61%
 ```
 
 ## Features
 
 | Area | State | Notes |
 |---|---|---|
-| Two players online | ✅ | Custom UDP transport, host-authoritative state |
-| Remote avatar | ✅ | Full clone of the player template, spawned in the peer's world |
-| Position & rotation | ✅ | ~20 Hz, smoothed on the receiver |
-| Full-body animation | ✅ | 67-joint pose streamed at 30 Hz (head, torso, legs, arms) |
-| Character model sync | ✅ | Equipped power's model is replicated to the remote avatar |
-| Powers: Claws | ✅ | |
-| Powers: Blade | ✅ | |
-| Powers: Whip Fist | ✅ | arm + pose; the tendril itself is an attached effect (WIP) |
-| Powers: Muscle Mass | ✅ | |
-| Powers: Hammer Fist | ✅ | |
-| Effects | ❌ | Neither world effects nor attached effects are replicated yet |
-| Disguise | ⏳ | Separate subsystem (`DisguiseMessage`), not replicated yet |
-| Impact slow motion | ⚙️ | Removed by default to keep the two games in sync (`no_slow_motion=1`) |
-| Steam install untouched | ✅ | The mod runs from copies in `TestInstances\` |
+| Two players online | ok | Custom UDP transport, host-authoritative state |
+| Remote avatar | ok | Full clone of the player template, spawned in the peer's world |
+| Position & rotation | ok | ~20 Hz, smoothed on the receiver |
+| Full-body animation | ok | 67-joint pose streamed at 30 Hz (head, torso, legs, arms) |
+| Powers (all five) | ok | Applied through the game's own transformation system: model, left arm and the game's transform effect |
+| Equip / unequip | ok | Both directions; reverting to normal hands uses the stock "no power" name |
+| Armour & shield | ok | Same path as the arm powers |
+| Whip Fist | local only | The whip cannot be worn by two actors in one process (engine limit), so the remote puppet keeps its previous appearance; the connecting tendril is not replicated either |
+| Effects | partial | World effects (spikes, explosions) replicate; attached effects and motion trails pending |
+| Disguise | pending | Separate subsystem (`DisguiseMessage`), not replicated yet |
+| Impact slow motion | removed | Disabled by default to keep the two games in sync (`no_slow_motion=1`) |
+| Steam install untouched | ok | The mod runs from copies in `TestInstances\` |
 
-> The receiving game only holds the power models its own player has used. The plugin can
-> load all five at once (`preload_powers=1`): it cycles the weapons slot through the arm
-> powers once and keeps a reference to each model, so the remote avatar can show any of
-> them. The co-op flow will run this during the loading screen.
-
-## How it works right now ( for testing)
+## How it works right now (for testing)
 
 Two instances of the game run side by side, each with the plugin. Each instance keeps a
 local **puppet**: a copy of the player template spawned into the same map, whose pose is
@@ -57,17 +50,19 @@ driven by the packets from the other game.
 - **Transport:** UDP, one socket per role (`27016` host / `27017` client). The engine's own
   sync session is not used.
 - **Packets:** `P1` position, `R1` object basis (facing), `A1` 67-joint pose (quaternions +
-  translations), `S1` transformation slots, `M2` character model name.
+  translations), `S1` transformation slots.
 - **Pose:** read from the player's `Attribute<Pose*>` (`0x10E80688`), sent at 30 Hz,
   nlerp-smoothed on the receiver and pushed into the puppet's pose.
-- **Transformations:** observed from the player's `TransformationBehaviour` slot table
-  (input-agnostic: wheel, D-pad, quick keys, pad), filtered by `hudPower` and applied to
-  the puppet with `StartTransformationMessage` only when `transform_start=1`. The shipped
-  path replicates the **model swap** instead, which is what the game really does.
-- **Model swap:** `RenderBehaviour +0x18` holds the drawable archetype name. The plugin
-  streams it, resolves the archetype by hash in the local content inventories and instances
-  it on the puppet (`CreateInstance` → `SetDrawable` → reuse of the streamed pose →
-  `Drawable::SetPose`).
+- **Transformations:** the player's `TransformationBehaviour` slot table is observed
+  (input-agnostic: wheel, D-pad, quick keys, pad). The `S1` packet carries the slot name
+  and the power's description name as 64-bit hashes; the receiver resolves the name in its
+  own game and calls the stock Lua helpers `go_SetDesiredTransformation` and
+  `go_EnableTransformationForSlot` on the puppet. The engine then does everything itself:
+  model, left arm, pose re-fit, transform effect.
+- **HUD isolation:** the engine also publishes the applied form into the local player's
+  quick-select database value (`HUDPlayerTransform`). Those writes are dropped while the
+  plugin is applying a power to the puppet, so the remote player's power never touches the
+  local player's own selection.
 
 ### Puppet setup
 
@@ -86,9 +81,10 @@ role=host            ; host | client
 port=27016
 peer_port=27017
 no_slow_motion=1     ; 1 = remove the impact slow motion (keeps both games in sync)
-sync_model=1         ; replicate the equipped power's model
-transform_start=0    ; 1 = also start transformations on the puppet (debug)
-sync_attached=0      ; 1 = replicate attached effects (debug, can duplicate arms)
+lua_powers=1         ; apply powers through the game's own Lua transformation helpers
+sync_model=0         ; legacy archetype swap (unused while lua_powers=1)
+dump_lua=0           ; 1 = log the power catalog, HUD writes and every Lua call
+whip_puppet=0        ; 1 = also apply the whip to the puppet (crashes: engine limit)
 ```
 
 ## Building
@@ -113,14 +109,16 @@ The repository keeps two prepared copies of the game in `TestInstances\0` and
 
 ## Roadmap
 
-1. Run the power-model preload from the co-op session start (the loading screen) instead of an opt-in flag, and preload the armour/shield models too.
-2. Effects: world effects (ground spikes, explosions) and attached effects (whip tendrils,
-   armour glow, motion trails are STC, will try to sync them but chances are uncertain).
+1. Whip Fist: give the remote puppet a whip representation that does not load the arm
+   content twice (the engine cannot share it between two actors), and replicate the
+   tendril that connects the blade to the arm.
+2. Effects: world effects (ground spikes, explosions) are replicated; attached effects and
+   motion trails still duplicate or crash when replayed.
 3. Disguise subsystem.
 4. Vehicles and weapons.
 5. Story mode.
-6. Health / damage / grab interactions between players (also STC, feel like this could be annoying, or make it optional).
-7. Polish: stability, packet rate, desync recovery.
+6. Health / damage / grab interactions between players (optional, likely annoying).
+7. Polish: stability, packet rate, desync recovery, co-op menu.
 
 ## Notes
 
@@ -139,9 +137,13 @@ of their respective owners.
 ## Resumen (ES)
 
 Co-op online para **Prototype (2009)**: un segundo jugador entra en tu ciudad y ve tu
-personaje moverse, luchar, transformarse y usar los poderes — y tú ves el suyo. El mod es un
-plugin ASI más un proxy de entrada; **no modifica ni distribuye archivos del juego**.
+personaje moverse, luchar, transformarse y usar los poderes - y tu ves el suyo. El mod es un
+plugin ASI mas un proxy de entrada; **no modifica ni distribuye archivos del juego**.
 
-Estado actual: Movimiento, avatar remoto, posición/rotación, animación completa de 67
-joints, sincronización del modelo del personaje y los cinco poderes de ataque (Garras, Cuchilla, Masa muscular, Puño de demolición y Látigo). Pendiente: precarga de modelos, efectos (de mundo y anclados que usan las habilidades y transformaciones),
-disfraz y daño/salud.
+Estado actual: movimiento, avatar remoto, posicion/rotacion, animacion completa de 67
+joints, **Garras, Cuchilla, Puno de demolicion, Masa muscular, armadura y escudo** con
+equipar y desequipar en ambos sentidos y el efecto de transformacion del propio juego, y el
+Latigo funcionando en el jugador que lo usa. Se aplican con la API Lua nativa del motor
+sobre el actor remoto, con aislamiento del HUD local. Pendiente: una representacion del
+Latigo para el actor remoto (el motor no permite cargar su contenido dos veces en el mismo
+proceso), su tendril, los efectos anclados, el disfraz y el dano/salud.
