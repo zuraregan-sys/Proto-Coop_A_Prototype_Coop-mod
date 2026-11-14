@@ -53,6 +53,7 @@ static void* g_controllerUpdate = nullptr;
 static DWORD g_lastTick = 0;
 static unsigned int g_recvCount = 0;
 static void FrameTick();
+static void PreloadTick();
 static void ReplayRemoteTransformations();
 static void SendMotionTrail(void* track);
 static void SpawnRemoteMotionTrail(const unsigned char* data, int length);
@@ -86,6 +87,7 @@ static volatile long g_remoteMotionTrail = 0;
 static bool g_noSlowMotion = true;
 static void* g_slowRequest = nullptr;
 static bool g_syncModel = true;
+static bool g_preloadPowers = false;
 static bool g_dumpAnim = false;
 static bool g_forceSwap = false;
 static bool g_transformStart = false;
@@ -202,6 +204,7 @@ static void ReadConfig()
     g_dumpTransform = GetPrivateProfileIntA("coop", "dump_transform", 0, path) != 0;
     g_noSlowMotion = GetPrivateProfileIntA("coop", "no_slow_motion", 1, path) != 0;
     g_syncModel = GetPrivateProfileIntA("coop", "sync_model", 1, path) != 0;
+    g_preloadPowers = GetPrivateProfileIntA("coop", "preload_powers", 0, path) != 0;
     g_dumpAnim = GetPrivateProfileIntA("coop", "dump_anim", 0, path) != 0;
     g_forceSwap = GetPrivateProfileIntA("coop", "force_swap", 0, path) != 0;
     g_transformStart = GetPrivateProfileIntA("coop", "transform_start", 0, path) != 0;
@@ -1966,6 +1969,108 @@ static bool WasSlotActive(const TransformSlotState& state)
     return false;
 }
 
+// Loads every arm power's body model by making the local player equip it for a
+// moment: the game only loads the model when the power is equipped, and the
+// model is released again when the power is switched away, so a reference is
+// kept for the rest of the session. Toggling each power off again corrupts the
+// engine state (the fourth cycle faults in the transformation handler), so the
+// sequence only switches forward and stops once at the end.
+static void PreloadTick()
+{
+    if (!g_preloadPowers) return;
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    if (player == nullptr) return;
+    static unsigned int first = 0;
+    static unsigned int last = 0;
+    static int next = 0;
+    static int active = -1;
+    static bool finished = false;
+    static const unsigned int huds[5] = { 1, 2, 3, 4, 5 };
+    unsigned int now = GetTickCount();
+    if (first == 0) { first = now; return; }
+    if (finished || now - first < 10000) return;
+    if (now - last < 1500) return;
+    last = now;
+    void* behaviour = FindBehaviourByName(player, "TransformationBehaviour");
+    if (behaviour == nullptr) return;
+    unsigned int slots = ReadU32(behaviour, 0x10);
+    unsigned int descriptions = ReadU32(behaviour, 0x20);
+    if (!Plausible(reinterpret_cast<void*>(slots)) || !Plausible(reinterpret_cast<void*>(descriptions)))
+        return;
+    unsigned int slotName[2];
+    memcpy(slotName, reinterpret_cast<void*>(slots), 8);
+
+    // Before replacing a power, keep a reference to its model: the content
+    // system releases the archetype when the power is switched away.
+    if (active >= 0)
+    {
+        unsigned int description = 0;
+        for (int i = 0; i < 12; ++i)
+        {
+            unsigned int candidate = ReadU32(reinterpret_cast<void*>(descriptions), i * 4);
+            if (!Plausible(reinterpret_cast<void*>(candidate))) continue;
+            if (ReadU32(reinterpret_cast<void*>(candidate), 0x64) == huds[active]) { description = candidate; break; }
+        }
+        if (description != 0)
+        {
+            unsigned int model = ReadU32(reinterpret_cast<void*>(description), 0x18);
+            void* archetype = FindDrawableArchetype(model);
+            if (archetype != nullptr && ReadU32(archetype, 0) == 0x10E6E394)
+            {
+                reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x005FE740))(archetype);
+                Log("preload: held model %08X archetype=%08X", model, (unsigned int)archetype);
+            }
+            else
+            {
+                Log("preload: model %08X not found to hold", model);
+            }
+        }
+        active = -1;
+    }
+
+    if (next >= 5)
+    {
+        SendTransformStart(player, slotName, false);
+        Log("preload: stop last");
+        for (int k = 0; k < 5; ++k)
+        {
+            unsigned int found = 0;
+            for (int i = 0; i < 12; ++i)
+            {
+                unsigned int candidate = ReadU32(reinterpret_cast<void*>(descriptions), i * 4);
+                if (!Plausible(reinterpret_cast<void*>(candidate))) continue;
+                if (ReadU32(reinterpret_cast<void*>(candidate), 0x64) == huds[k]) { found = candidate; break; }
+            }
+            if (found == 0) continue;
+            unsigned int model = ReadU32(reinterpret_cast<void*>(found), 0x18);
+            Log("preload: model %08X loaded=%d", model, FindDrawableArchetype(model) != nullptr ? 1 : 0);
+        }
+        finished = true;
+        Log("preload: done");
+        return;
+    }
+
+    unsigned int description = 0;
+    for (int i = 0; i < 12; ++i)
+    {
+        unsigned int candidate = ReadU32(reinterpret_cast<void*>(descriptions), i * 4);
+        if (!Plausible(reinterpret_cast<void*>(candidate))) continue;
+        if (ReadU32(reinterpret_cast<void*>(candidate), 0x64) == huds[next]) { description = candidate; break; }
+    }
+    if (description == 0) { ++next; return; }
+    unsigned int model = ReadU32(reinterpret_cast<void*>(description), 0x18);
+    unsigned int descriptionName[2];
+    memcpy(descriptionName, reinterpret_cast<void*>(description + 8), 8);
+    unsigned char message[0x28] = { 0 };
+    reinterpret_cast<void (__thiscall*)(void*, const void*, const void*, bool)>(At<void*>(0x001215B0))(
+        message, slotName, descriptionName, false);
+    reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(player, message);
+    SendTransformStart(player, slotName, false);
+    Log("preload: start hud=%u model=%08X", huds[next], model);
+    active = next;
+    ++next;
+}
+
 static void ApplyTransformState(const TransformSlotState* state, int count, bool force)
 {
     if (g_puppetObject == nullptr || g_puppetHandle == 0xFFFF) return;
@@ -2284,6 +2389,7 @@ static void FrameTick()
     static void* lastPlayer = nullptr;
     void* localPlayer = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     ApplyModel();
+    PreloadTick();
     if (g_dumpAnim && (g_updateCalls % 15) == 0)
     {
         DumpAnimChanges(localPlayer, "player");

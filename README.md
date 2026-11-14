@@ -43,9 +43,10 @@ Overall                                █████████████�
 | Impact slow motion | ⚙️ | Removed by default to keep the two games in sync (`no_slow_motion=1`) |
 | Steam install untouched | ✅ | The mod runs from copies in `TestInstances\` |
 
-> Powers appear on the remote avatar as soon as the **receiving** game has the power's
-> model loaded (it loads the first time that player equips that power). Preloading the
-> models is the next milestone.
+> The receiving game only holds the power models its own player has used. The plugin can
+> load all five at once (`preload_powers=1`): it cycles the weapons slot through the arm
+> powers once and keeps a reference to each model, so the remote avatar can show any of
+> them. The co-op flow will run this during the loading screen.
 
 ## How it works right now ( for testing)
 
@@ -112,7 +113,7 @@ The repository keeps two prepared copies of the game in `TestInstances\0` and
 
 ## Roadmap
 
-1. Preload the power models on both sides (currently both players need to equip the same power for it to load and be visible in each others character).
+1. Run the power-model preload from the co-op session start (the loading screen) instead of an opt-in flag, and preload the armour/shield models too.
 2. Effects: world effects (ground spikes, explosions) and attached effects (whip tendrils,
    armour glow, motion trails are STC, will try to sync them but chances are uncertain).
 3. Disguise subsystem.

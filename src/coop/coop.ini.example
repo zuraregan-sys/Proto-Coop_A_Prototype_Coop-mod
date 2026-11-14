@@ -4,3 +4,6 @@
 role=host
 port=27016
 peer_port=27017
+no_slow_motion=1
+sync_model=1
+preload_powers=0
