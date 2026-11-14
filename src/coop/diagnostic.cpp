@@ -1978,15 +1978,15 @@ static bool WasSlotActive(const TransformSlotState& state)
 static void PreloadTick()
 {
     if (!g_preloadPowers) return;
-    // The preload runs on the puppet: it is a disposable copy with the same
-    // transformation descriptions, so the local player's own power (and the
-    // game's "last selected power" state) is never touched.
-    void* player = g_puppetObject;
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     if (player == nullptr) return;
     static unsigned int first = 0;
     static unsigned int last = 0;
     static int next = 0;
-    static int active = -1;
+    static int holdPending = -1;
+    static int holdTries = 0;
+    static bool saved = false;
+    static unsigned int savedDesired = 0;
     static bool finished = false;
     static const unsigned int huds[5] = { 1, 2, 3, 4, 5 };
     unsigned int now = GetTickCount();
@@ -2002,39 +2002,53 @@ static void PreloadTick()
         return;
     unsigned int slotName[2];
     memcpy(slotName, reinterpret_cast<void*>(slots), 8);
+    if (!saved)
+    {
+        saved = true;
+        savedDesired = ReadU32(reinterpret_cast<void*>(slots), 0x08);
+    }
 
-    // Before replacing a power, keep a reference to its model: the content
-    // system releases the archetype when the power is switched away.
-    if (active >= 0)
+    // Keep a reference to the model of the power started in the previous step
+    // before replacing it: the content system releases the archetype when the
+    // power is switched away. Retry while the model finishes loading.
+    if (holdPending >= 0)
     {
         unsigned int description = 0;
         for (int i = 0; i < 12; ++i)
         {
             unsigned int candidate = ReadU32(reinterpret_cast<void*>(descriptions), i * 4);
             if (!Plausible(reinterpret_cast<void*>(candidate))) continue;
-            if (ReadU32(reinterpret_cast<void*>(candidate), 0x64) == huds[active]) { description = candidate; break; }
+            if (ReadU32(reinterpret_cast<void*>(candidate), 0x64) == huds[holdPending])
+            {
+                description = candidate;
+                break;
+            }
         }
-        if (description != 0)
+        unsigned int model = description != 0 ? ReadU32(reinterpret_cast<void*>(description), 0x18) : 0;
+        void* archetype = model != 0 ? FindDrawableArchetype(model) : nullptr;
+        if (archetype != nullptr && ReadU32(archetype, 0) == 0x10E6E394)
         {
-            unsigned int model = ReadU32(reinterpret_cast<void*>(description), 0x18);
-            void* archetype = FindDrawableArchetype(model);
-            if (archetype != nullptr && ReadU32(archetype, 0) == 0x10E6E394)
-            {
-                reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x005FE740))(archetype);
-                Log("preload: held model %08X archetype=%08X", model, (unsigned int)archetype);
-            }
-            else
-            {
-                Log("preload: model %08X not found to hold", model);
-            }
+            reinterpret_cast<void (__thiscall*)(void*)>(At<void*>(0x005FE740))(archetype);
+            Log("preload: held model %08X archetype=%08X", model, (unsigned int)archetype);
+            holdPending = -1;
         }
-        active = -1;
+        else if (++holdTries < 4)
+        {
+            Log("preload: waiting for model %08X", model);
+            return;
+        }
+        else
+        {
+            Log("preload: model %08X never appeared", model);
+            holdPending = -1;
+        }
     }
 
     if (next >= 5)
     {
         SendTransformStart(player, slotName, false);
-        Log("preload: stop last");
+        *reinterpret_cast<unsigned int*>(slots + 0x08) = savedDesired;
+        Log("preload: stop last, desired restored to %08X", savedDesired);
         for (int k = 0; k < 5; ++k)
         {
             unsigned int found = 0;
@@ -2070,7 +2084,8 @@ static void PreloadTick()
     reinterpret_cast<bool (__thiscall*)(void*, void*)>(At<void*>(0x007E0810))(player, message);
     SendTransformStart(player, slotName, false);
     Log("preload: start hud=%u model=%08X", huds[next], model);
-    active = next;
+    holdPending = next;
+    holdTries = 0;
     ++next;
 }
 
