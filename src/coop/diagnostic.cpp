@@ -68,6 +68,8 @@ static unsigned int GetAttributeValue(void* object, unsigned int vtable);
 static sockaddr_in g_peer;
 static unsigned short g_localPort = 27016;
 static unsigned short g_peerPort = 27017;
+static char g_peerIp[64] = "127.0.0.1";
+static char g_bindIp[64] = "0.0.0.0";
 static bool g_isHost = true;
 static int g_testMove = 0;
 static bool g_testMoved = false;
@@ -214,6 +216,8 @@ static void ReadConfig()
     g_isHost = (role[0] == 'h' || role[0] == 'H');
     g_localPort = (unsigned short)GetPrivateProfileIntA("coop", "port", g_isHost ? 27016 : 27017, path);
     g_peerPort = (unsigned short)GetPrivateProfileIntA("coop", "peer_port", g_isHost ? 27017 : 27016, path);
+    GetPrivateProfileStringA("coop", "peer_ip", "127.0.0.1", g_peerIp, sizeof(g_peerIp), path);
+    GetPrivateProfileStringA("coop", "bind_ip", "0.0.0.0", g_bindIp, sizeof(g_bindIp), path);
     g_peerMask = g_isHost ? 1 : 2;
     g_testMove = GetPrivateProfileIntA("coop", "test_move", 0, path);
     g_testOffsetY = (float)GetPrivateProfileIntA("coop", "test_offset_y", 0, path);
@@ -250,8 +254,8 @@ static void ReadConfig()
     g_intentTest = (float)GetPrivateProfileIntA("coop", "intent_test", 0, path);
     g_fakeSession = GetPrivateProfileIntA("coop", "fake_session", 0, path) != 0;
     g_puppetStatic = GetPrivateProfileIntA("coop", "puppet_static", 0, path) != 0;
-    Log("config role=%s local=%u peer=%u mask=%d offset_y=%.0f", g_isHost ? "host" : "client", g_localPort,
-        g_peerPort, g_peerMask, g_testOffsetY);
+    Log("config role=%s local=%u peer=%u peer_ip=%s bind_ip=%s mask=%d offset_y=%.0f",
+        g_isHost ? "host" : "client", g_localPort, g_peerPort, g_peerIp, g_bindIp, g_peerMask, g_testOffsetY);
 }
 
 static bool InitSocket()
@@ -270,7 +274,7 @@ static bool InitSocket()
     }
     sockaddr_in local = {};
     local.sin_family = AF_INET;
-    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    local.sin_addr.s_addr = inet_addr(g_bindIp);
     local.sin_port = htons(g_localPort);
     if (bind(g_socket, (sockaddr*)&local, sizeof(local)) != 0)
     {
@@ -280,9 +284,9 @@ static bool InitSocket()
     u_long nonblocking = 1;
     ioctlsocket(g_socket, FIONBIO, &nonblocking);
     g_peer.sin_family = AF_INET;
-    g_peer.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    g_peer.sin_addr.s_addr = inet_addr(g_peerIp);
     g_peer.sin_port = htons(g_peerPort);
-    Log("UDP ready local=%u peer=%u", g_localPort, g_peerPort);
+    Log("UDP ready local=%u peer=%s:%u", g_localPort, g_peerIp, g_peerPort);
     return true;
 }
 

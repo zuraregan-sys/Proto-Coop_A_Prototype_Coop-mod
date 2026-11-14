@@ -131,6 +131,35 @@ Requires the 32-bit MinGW toolchain used by the project (`tools\build-coop.ps1`)
 
 Outputs `build\coop\prototype_coop.asi` and `build\coop\xinput1_3.dll`.
 
+## Play with friends
+
+1. Both players need their own **Prototype (Steam, App ID 10150)** and
+   **PrototypeFix** installed (PrototypeFix is the ASI loader the game uses).
+2. Build the mod and create the friend package:
+
+   ```powershell
+   .\tools\build-coop.ps1
+   .\tools\make-package.ps1
+   ```
+
+   `dist\ProtoCoop-<build>.zip` contains only the mod (`prototype_coop.asi`),
+   a `coop.ini` template and a plain-words `LEEME.txt`, no game files.
+3. Both copy `prototype_coop.asi` next to `prototypef.exe` and edit `coop.ini`:
+
+   | | Host | Guest |
+   |---|---|---|
+   | `role` | `host` | `client` |
+   | `port` | `27016` | `27017` |
+   | `peer_port` | `27017` | `27016` |
+   | `peer_ip` | the guest's address | the host's address |
+
+4. Same network: use each other's local IP (`ipconfig`). Over the Internet the
+   simple path is a mesh VPN (Tailscale, ZeroTier, Hamachi/Radmin) and the VPN
+   address as `peer_ip`; otherwise forward UDP 27016/27017 and open them in the
+   firewall. Allow `prototypef.exe` on private networks when Windows asks.
+5. Progress: on one PC both instances share the save folder. For two PCs copy
+   the host's slots first with `tools\sync-save.ps1`.
+
 ## Saves
 
 On one PC both instances share `%USERPROFILE%\Documents\Prototype`, so they

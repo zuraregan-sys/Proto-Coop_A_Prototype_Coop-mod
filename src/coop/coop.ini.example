@@ -1,9 +1,19 @@
 ; Prototype co-op test config. Copy next to prototype_coop.asi.
 ; For two instances on one PC use host/client with different ports.
+; Prototype co-op config. Copy next to prototype_coop.asi.
+;
+; One PC (two instances): host and client with different ports and 127.0.0.1.
+; Two PCs: each side uses role/port/peer_port as below and sets peer_ip to the
+; other machine's address (LAN IP, or the VPN IP with Tailscale/ZeroTier).
 [coop]
-role=host
-port=27016
-peer_port=27017
+role=host            ; host | client
+port=27016           ; this machine's UDP port
+peer_port=27017      ; the other machine's UDP port
+peer_ip=127.0.0.1    ; the other machine's address
+bind_ip=0.0.0.0      ; 0.0.0.0 accepts the LAN/VPN; 127.0.0.1 is one PC only
 no_slow_motion=1
-sync_model=1
-preload_powers=0
+lua_powers=1
+puppet_nochoreo=1
+whip_puppet=0
+city_radius=300
+city_vehicles=1
