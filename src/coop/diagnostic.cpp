@@ -1978,7 +1978,10 @@ static bool WasSlotActive(const TransformSlotState& state)
 static void PreloadTick()
 {
     if (!g_preloadPowers) return;
-    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    // The preload runs on the puppet: it is a disposable copy with the same
+    // transformation descriptions, so the local player's own power (and the
+    // game's "last selected power" state) is never touched.
+    void* player = g_puppetObject;
     if (player == nullptr) return;
     static unsigned int first = 0;
     static unsigned int last = 0;
