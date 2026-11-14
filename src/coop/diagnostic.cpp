@@ -1224,10 +1224,7 @@ static void* FindDrawableArchetype(unsigned int hash)
 static void SendModel()
 {
     if (!g_syncModel || g_socket == INVALID_SOCKET) return;
-    // The preload runs on the puppet: it is a disposable copy with the same
-    // transformation descriptions, so loading the models never touches the
-    // local player (its model, power selection and drawable stay untouched).
-    void* player = g_puppetObject;
+    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
     if (player == nullptr) return;
     void* render = FindBehaviourByName(player, "RenderBehaviour");
     if (render == nullptr) return;
@@ -1247,7 +1244,8 @@ static void SendModel()
     memcpy(packet + 2, name, 8);
     sendto(g_socket, reinterpret_cast<const char*>(packet), 10, 0, reinterpret_cast<sockaddr*>(&g_peer),
         sizeof(g_peer));
-    Log("model send: %08X%08X", (unsigned int)(value >> 32), (unsigned int)value);
+    Log("model send: %08X%08X player=%08X render=%08X owner=%08X", (unsigned int)(value >> 32),
+        (unsigned int)value, (unsigned int)player, (unsigned int)render, ReadU32(render, 4));
 }
 
 static void ApplyModel()
@@ -1862,7 +1860,10 @@ static bool WasSlotActive(const TransformSlotState& state)
 static void PreloadTick()
 {
     if (!g_preloadPowers) return;
-    void* player = g_getPlayerObject ? g_getPlayerObject(0) : nullptr;
+    // The preload runs on the puppet: it is a disposable copy with the same
+    // transformation descriptions, so loading the models never touches the
+    // local player (its model, power selection and drawable stay untouched).
+    void* player = g_puppetObject;
     if (player == nullptr) return;
     static unsigned int first = 0;
     static unsigned int last = 0;
